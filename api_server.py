@@ -472,6 +472,7 @@ async def _handle_audio(
     stream: Optional[str],
     beam: Optional[str],
     timestamp_granularities: Optional[List[str]] = None,
+    num_speakers: Optional[int] = None,
 ):
     """
     Shared implementation for transcription and translation endpoints.
@@ -593,7 +594,13 @@ async def _handle_audio(
                     initial_prompt=prompt or None,
                     temperature=temperature,
                     beam_size=request_beam,
-                    word_timestamps=wt_flag,
+                    # Word-level timing is needed internally for accurate
+                    # per-speaker segment boundaries even if the caller did
+                    # not request word timestamps in the response — a whole
+                    # Whisper segment can otherwise span several real
+                    # speaker turns (e.g. short greetings) and get blurred
+                    # onto a single speaker.
+                    word_timestamps=(wt_flag or _diarization_enabled),
                     vad_filter=True,
                 )
                 segments = list(segments_gen)  # consume the generator before the temp file is removed
@@ -607,18 +614,28 @@ async def _handle_audio(
         # ------------------------------------------------------------------
         # Diarization (optional post-processing)
         # ------------------------------------------------------------------
-        speaker_map = None  # {segment_index: speaker_label}
+        speaker_map = None  # {segment_index: speaker_label} — coarse fallback
+        refined_segments = None  # word-accurate resegmentation, when available
         if _diarization_enabled:
             try:
                 import diarizer
-                turns = diarizer.diarize(tmp_path)
-                # Build lightweight segment dicts for alignment
-                seg_dicts = [
-                    {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-                    for seg in segments
-                ]
-                diarizer.assign_speakers(seg_dicts, turns)
-                speaker_map = {i: d["speaker"] for i, d in enumerate(seg_dicts)}
+                turns = diarizer.diarize(tmp_path, num_speakers=num_speakers)
+
+                # Preferred path: resegment at the word level so short
+                # interjections (greetings, "yes"/"no", etc.) that would
+                # otherwise be blurred into a longer neighbouring segment
+                # get their own, correctly-attributed entry.
+                refined_segments = diarizer.resegment_by_word(segments, turns)
+
+                if not refined_segments:
+                    # Fallback: no word-level timing available for this
+                    # request — assign one speaker per whole Whisper segment.
+                    seg_dicts = [
+                        {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+                        for seg in segments
+                    ]
+                    diarizer.assign_speakers(seg_dicts, turns)
+                    speaker_map = {i: d["speaker"] for i, d in enumerate(seg_dicts)}
             except Exception as exc:
                 logger.warning("Diarization failed (returning without speakers): %s", exc)
 
@@ -656,32 +673,59 @@ async def _handle_audio(
     if response_format == "verbose_json":
         seg_list = []
         all_words = []
-        for idx, seg in enumerate(segments):
-            seg_dict = {
-                "id": idx,
-                "seek": seg.seek,
-                "start": round(seg.start, 3),
-                "end": round(seg.end, 3),
-                "text": seg.text.strip(),
-                "tokens": seg.tokens,
-                "temperature": round(seg.temperature, 3) if seg.temperature is not None else temperature,
-                "avg_logprob": round(seg.avg_logprob, 4),
-                "compression_ratio": round(seg.compression_ratio, 4),
-                "no_speech_prob": round(seg.no_speech_prob, 4),
-            }
-            if speaker_map:
-                seg_dict["speaker"] = speaker_map.get(idx, "SPEAKER_00")
-            if wt_flag and seg.words:
-                all_words.extend(
-                    {
-                        "word": w.word.strip(),
-                        "start": round(w.start, 3),
-                        "end": round(w.end, 3),
-                        "probability": round(w.probability, 4),
-                    }
-                    for w in seg.words
-                )
-            seg_list.append(seg_dict)
+
+        if refined_segments is not None:
+            # Word-accurate segments: one entry per contiguous same-speaker
+            # run, rather than one per raw Whisper segment. These carry
+            # start/end/text/speaker only (the richer per-segment stats
+            # below don't apply to a resegmented run).
+            for idx, seg in enumerate(refined_segments):
+                seg_list.append({
+                    "id": idx,
+                    "start": round(seg["start"], 3),
+                    "end": round(seg["end"], 3),
+                    "text": seg["text"],
+                    "speaker": seg["speaker"],
+                })
+            if wt_flag:
+                for seg in segments:
+                    if seg.words:
+                        all_words.extend(
+                            {
+                                "word": w.word.strip(),
+                                "start": round(w.start, 3),
+                                "end": round(w.end, 3),
+                                "probability": round(w.probability, 4),
+                            }
+                            for w in seg.words
+                        )
+        else:
+            for idx, seg in enumerate(segments):
+                seg_dict = {
+                    "id": idx,
+                    "seek": seg.seek,
+                    "start": round(seg.start, 3),
+                    "end": round(seg.end, 3),
+                    "text": seg.text.strip(),
+                    "tokens": seg.tokens,
+                    "temperature": round(seg.temperature, 3) if seg.temperature is not None else temperature,
+                    "avg_logprob": round(seg.avg_logprob, 4),
+                    "compression_ratio": round(seg.compression_ratio, 4),
+                    "no_speech_prob": round(seg.no_speech_prob, 4),
+                }
+                if speaker_map:
+                    seg_dict["speaker"] = speaker_map.get(idx, "SPEAKER_00")
+                if wt_flag and seg.words:
+                    all_words.extend(
+                        {
+                            "word": w.word.strip(),
+                            "start": round(w.start, 3),
+                            "end": round(w.end, 3),
+                            "probability": round(w.probability, 4),
+                        }
+                        for w in seg.words
+                    )
+                seg_list.append(seg_dict)
         resp = {
             "task": task,
             "language": info.language,
@@ -766,6 +810,14 @@ async def transcribe(
         description="Unsupported OpenAI diarization speaker-reference audio.",
     ),
     known_speaker_references_brackets: Optional[List[str]] = Form(default=None, alias="known_speaker_references[]"),
+    num_speakers: Optional[int] = Form(
+        default=None,
+        description=(
+            "Local extension: expected number of speakers for this request's "
+            "diarization. Overrides WHISPER_DIARIZE_NUM_SPEAKERS for this call "
+            "only. Omit for automatic speaker-count detection."
+        ),
+    ),
     _auth: None = Depends(_verify_api_key),
 ):
     """
@@ -803,6 +855,7 @@ async def transcribe(
         stream=stream,
         beam=beam,
         timestamp_granularities=timestamp_granularities,
+        num_speakers=num_speakers,
     )
 
 

@@ -43,7 +43,11 @@ _EMB_MODEL_REL = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_sd = None  # OfflineSpeakerDiarization instance
+_sd = None  # OfflineSpeakerDiarization instance (default, loaded at startup)
+_seg_path = None  # cached path, kept so per-request pipelines can be rebuilt cheaply
+_emb_path = None
+_default_threshold = 0.5
+_embedding_extractor = None  # lazily built standalone embedding extractor, for sliver clean-up
 
 
 def _download_file(url: str, dest: str) -> None:
@@ -80,12 +84,28 @@ def load(
     cluster_threshold: float = 0.5,
 ) -> None:
     """Download ONNX models if needed, initialize the diarization pipeline."""
-    global _sd
+    global _sd, _seg_path, _emb_path, _default_threshold
 
     seg_path, emb_path = _ensure_models(cache_dir)
+    _seg_path, _emb_path = seg_path, emb_path
+    _default_threshold = cluster_threshold
 
-    # If the speaker count is unknown, use threshold-based auto clustering.
-    num_clusters = num_speakers if num_speakers > 0 else -1
+    _sd = _build_pipeline(seg_path, emb_path, num_speakers, cluster_threshold)
+    logger.info(
+        "Diarization pipeline ready (sample_rate=%d, num_clusters=%d, threshold=%.2f)",
+        _sd.sample_rate,
+        num_speakers if num_speakers > 0 else -1,
+        cluster_threshold,
+    )
+
+
+def _build_pipeline(seg_path: str, emb_path: str, num_speakers: int, cluster_threshold: float):
+    """Construct a fresh OfflineSpeakerDiarization pipeline for a given speaker
+    count. Cheap to call repeatedly: model files are already on disk (no
+    download), this just builds the in-memory ONNX sessions + clustering
+    config. Used both at startup and, when a caller asks for a different
+    speaker count, per individual request."""
+    num_clusters = num_speakers if num_speakers and num_speakers > 0 else -1
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
@@ -107,13 +127,7 @@ def load(
             "Diarization config validation failed. Check that model files exist."
         )
 
-    _sd = sherpa_onnx.OfflineSpeakerDiarization(config)
-    logger.info(
-        "Diarization pipeline ready (sample_rate=%d, num_clusters=%d, threshold=%.2f)",
-        _sd.sample_rate,
-        num_clusters,
-        cluster_threshold,
-    )
+    return sherpa_onnx.OfflineSpeakerDiarization(config)
 
 
 def is_loaded() -> bool:
@@ -153,22 +167,189 @@ def _load_audio(audio_path: str, target_sr: int = 16000):
     return audio
 
 
-def diarize(audio_path: str):
+def diarize(audio_path: str, num_speakers: int = None):
     """
     Run diarization on an audio file.
+
+    num_speakers: optional per-request override of the expected speaker
+    count. When given (and different from what's currently loaded), a fresh
+    pipeline is built just for this call using the already-cached model
+    files (no re-download) — this lets each request specify how many
+    participants it expects (e.g. "4" for a known meeting size) instead of
+    relying on a single server-wide guess, which tends to over-split a
+    single voice into many spurious speakers on long or noisy recordings.
 
     Returns a list of (start, end, speaker_label) tuples sorted by start time.
     """
     if _sd is None:
         raise RuntimeError("Diarizer not loaded. Call diarizer.load() first.")
 
-    audio = _load_audio(audio_path, target_sr=_sd.sample_rate)
+    pipeline = _sd
+    if num_speakers is not None and num_speakers > 0:
+        pipeline = _build_pipeline(_seg_path, _emb_path, num_speakers, _default_threshold)
 
-    result = _sd.process(audio).sort_by_start_time()
+    audio = _load_audio(audio_path, target_sr=pipeline.sample_rate)
+
+    result = pipeline.process(audio).sort_by_start_time()
     turns = []
     for r in result:
         turns.append((r.start, r.end, f"SPEAKER_{r.speaker:02d}"))
+
+    # Clean-up pass: the underlying clustering occasionally splits off a
+    # tiny, short-lived "phantom" speaker from a brief burst of noise or an
+    # onset artifact (observed: a real 2-person recording producing 4
+    # labels, two of which totalled under 1 second each). Such slivers are
+    # reassigned based on actual VOICE similarity (cosine similarity of
+    # speaker embeddings) to the other, larger speaker clusters — NOT by
+    # temporal proximity, which was tried first and shown (by direct test)
+    # to often merge a short reply into whichever speaker merely happened
+    # to talk nearby in time, rather than the speaker who actually said it.
+    turns = _merge_sliver_speakers_by_voice(turns, audio, pipeline.sample_rate)
     return turns
+
+
+def _get_embedding_extractor():
+    global _embedding_extractor
+    if _embedding_extractor is None:
+        cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=_emb_path)
+        _embedding_extractor = sherpa_onnx.SpeakerEmbeddingExtractor(cfg)
+    return _embedding_extractor
+
+
+def _embed_segment(audio, sample_rate, start, end):
+    extractor = _get_embedding_extractor()
+    stream = extractor.create_stream()
+    chunk = audio[int(start * sample_rate):int(end * sample_rate)]
+    stream.accept_waveform(sample_rate=sample_rate, waveform=chunk)
+    stream.input_finished()
+    return np.array(extractor.compute(stream))
+
+
+def _cosine_sim(a, b):
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
+def _merge_sliver_speakers_by_voice(
+    turns, audio, sample_rate, min_total_seconds: float = 1.5, min_share: float = 0.08,
+):
+    """
+    Fold speakers with very little total talk time into whichever other
+    speaker they actually sound most like (voice-embedding cosine
+    similarity), rather than whichever speaker merely talks nearby in time.
+    """
+    if len(turns) <= 1:
+        return turns
+
+    totals = {}
+    for start, end, speaker in turns:
+        totals[speaker] = totals.get(speaker, 0.0) + (end - start)
+    if len(totals) <= 1:
+        return turns
+
+    longest_total = max(totals.values())
+    slivers = {
+        spk for spk, total in totals.items()
+        if total < min_total_seconds and total < min_share * longest_total
+    }
+    if not slivers:
+        return turns
+
+    main_speakers = [spk for spk in totals if spk not in slivers]
+    if not main_speakers:
+        return turns  # everything is a "sliver" (very short clip) — nothing sensible to merge into
+
+    # Centroid embedding per main (non-sliver) speaker, averaged over all
+    # of that speaker's turns.
+    centroids = {}
+    for spk in main_speakers:
+        embs = [
+            _embed_segment(audio, sample_rate, s, e)
+            for s, e, sp in turns if sp == spk
+        ]
+        centroids[spk] = np.mean(embs, axis=0)
+
+    cleaned = list(turns)
+    for i, (start, end, speaker) in enumerate(cleaned):
+        if speaker not in slivers:
+            continue
+        seg_emb = _embed_segment(audio, sample_rate, start, end)
+        best_spk = max(main_speakers, key=lambda spk: _cosine_sim(seg_emb, centroids[spk]))
+        cleaned[i] = (start, end, best_spk)
+
+    return cleaned
+
+
+def resegment_by_word(segments_with_words, diarization_turns):
+    """
+    Rebuild segments at the word level instead of the whisper-segment level.
+
+    Problem this solves: a single Whisper segment can span several real
+    speaker turns (e.g. a 6-second segment covering "good morning steve" /
+    "good morning katie" / the start of a longer sentence) — assigning one
+    speaker to the whole segment blurs or loses short interjections like
+    greetings. By checking each individual word's overlap with the
+    diarization turns and only starting a new output segment when the
+    speaker actually changes, short exchanges are preserved correctly.
+
+    Args:
+        segments_with_words: iterable of Whisper segments, each exposing
+            .words (iterable of objects/dicts with word/start/end).
+        diarization_turns: list of (start, end, speaker_label) tuples.
+
+    Returns:
+        List of dicts: {"start", "end", "text", "speaker"} — one per
+        contiguous run of same-speaker words. Falls back to the original
+        whisper-segment granularity for any segment that has no word-level
+        timing available.
+    """
+    if not diarization_turns:
+        return None  # caller should fall back to whole-segment assignment
+
+    def best_speaker_for(w_start, w_end):
+        best_speaker, best_overlap = "SPEAKER_00", 0.0
+        for turn_start, turn_end, speaker in diarization_turns:
+            overlap = max(0.0, min(w_end, turn_end) - max(w_start, turn_start))
+            if overlap > best_overlap:
+                best_overlap, best_speaker = overlap, speaker
+        return best_speaker
+
+    out = []
+    current = None
+    for seg in segments_with_words:
+        words = getattr(seg, "words", None) or (seg.get("words") if isinstance(seg, dict) else None)
+        if not words:
+            # No word-level timing for this segment (e.g. it was pure
+            # silence/music) — treat the whole segment as one unit.
+            words = [type("W", (), {
+                "word": (seg.text if hasattr(seg, "text") else seg.get("text", "")),
+                "start": seg.start if hasattr(seg, "start") else seg.get("start"),
+                "end": seg.end if hasattr(seg, "end") else seg.get("end"),
+            })]
+
+        for w in words:
+            w_word = w.word if hasattr(w, "word") else w.get("word", "")
+            w_start = w.start if hasattr(w, "start") else w.get("start")
+            w_end = w.end if hasattr(w, "end") else w.get("end")
+            if w_start is None or w_end is None:
+                continue
+            speaker = best_speaker_for(w_start, w_end)
+
+            if current and current["speaker"] == speaker:
+                current["text"] += w_word
+                current["end"] = w_end
+            else:
+                if current:
+                    out.append(current)
+                current = {"start": w_start, "end": w_end, "text": w_word, "speaker": speaker}
+
+    if current:
+        out.append(current)
+
+    for seg in out:
+        seg["text"] = seg["text"].strip()
+
+    return out
 
 
 def assign_speakers(segments, diarization_turns):
