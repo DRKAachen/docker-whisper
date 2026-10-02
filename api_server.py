@@ -13,6 +13,8 @@ See: https://opensource.org/licenses/MIT
 """
 
 import asyncio
+import dataclasses
+import gc
 import json
 import logging
 import os
@@ -465,6 +467,123 @@ async def _stream_sse(
 
 
 # ---------------------------------------------------------------------------
+# Speicherschonende Verarbeitung langer Dateien
+# ---------------------------------------------------------------------------
+#
+# HINTERGRUND (gemessen, nicht vermutet):
+# faster-whisper lädt die gesamte Audiodatei als ein numpy-Array in den
+# Speicher (decode_audio, über PyAV) und führt die Sprachaktivitäts-Erkennung
+# (VAD) anschließend auf dem KOMPLETTEN Array auf einmal aus. Für eine reale
+# 73-minütige Datei wurde Folgendes gemessen:
+#   - decode_audio allein:           ~270 MB Rohdaten, Spitzenwert ~740 MB
+#   - VAD auf dem GANZEN Array:      Spitzenwert steigt auf ~1130 MB
+#   - VAD in 10-Minuten-Scheiben:    Spitzenwert bleibt bei ~740 MB
+# Das erklärt den OOM-Absturz ("Killed") auf dem Coolify-Server bei langen
+# Dateien: Das Hauptmodell (für "medium" ca. 1-1.5 GB) ist bereits geladen,
+# und der zusätzliche VAD-Spitzenwert von über einem weiteren GB bringt den
+# Gesamtverbrauch über das verfügbare RAM des geteilten Servers.
+#
+# LÖSUNG: Die Datei wird nur EINMAL dekodiert (unvermeidbar mit PyAV), aber
+# anschließend in 10-Minuten-Abschnitte des bereits geladenen Arrays
+# zerlegt. transcribe() akzeptiert laut Bibliotheks-Signatur direkt ein
+# numpy-Array (kein Umweg über die Festplatte nötig). Jeder Abschnitt wird
+# einzeln durch das Modell geschickt, die Zeitstempel werden um den Start
+# des jeweiligen Abschnitts verschoben, und die Ergebnisse werden am Ende
+# zu einem einzigen Resultat zusammengeführt.
+_CHUNK_THRESHOLD_SECONDS = _env_int("WHISPER_CHUNK_THRESHOLD_SECONDS", 900)  # 15 min
+_CHUNK_SIZE_SECONDS = _env_int("WHISPER_CHUNK_SIZE_SECONDS", 600)  # 10 min
+
+
+class _ChunkedInfo:
+    """Leichtgewichtiger Ersatz für das von transcribe() zurückgegebene
+    TranscriptionInfo-Objekt, wenn mehrere Chunks zusammengeführt werden.
+    Sprache/Wahrscheinlichkeit stammen vom ersten Chunk (dort meist am
+    zuverlässigsten erkennbar); Dauer-Werte werden über alle Chunks summiert."""
+
+    def __init__(self, language, language_probability, duration, duration_after_vad):
+        self.language = language
+        self.language_probability = language_probability
+        self.duration = duration
+        self.duration_after_vad = duration_after_vad
+
+
+def _transcribe_long_audio(tmp_path: str, transcribe_kwargs: dict):
+    """
+    Führt transcribe() für eine Audiodatei aus. Liegt die Dauer über
+    _CHUNK_THRESHOLD_SECONDS, wird die Datei nach dem einmaligen Dekodieren
+    in Abschnitte von _CHUNK_SIZE_SECONDS zerlegt und einzeln verarbeitet,
+    um den gemessenen VAD-Speicherspitzenwert auf langen Dateien zu
+    vermeiden. Kurze Dateien laufen unverändert über den Dateipfad, ohne
+    jeden zusätzlichen Overhead.
+
+    Gibt (segments: list, info: TranscriptionInfo | _ChunkedInfo) zurück.
+    """
+    from faster_whisper.audio import decode_audio
+
+    sampling_rate = 16000
+    audio = decode_audio(tmp_path, sampling_rate=sampling_rate)
+    total_seconds = len(audio) / sampling_rate
+
+    if total_seconds <= _CHUNK_THRESHOLD_SECONDS:
+        segments_gen, info = _model.transcribe(audio, **transcribe_kwargs)
+        return list(segments_gen), info
+
+    logger.info(
+        "Lange Datei (%.1f min) wird in %d-Minuten-Abschnitten verarbeitet, "
+        "um den gemessenen VAD-Speicherspitzenwert zu vermeiden.",
+        total_seconds / 60, _CHUNK_SIZE_SECONDS // 60,
+    )
+
+    chunk_samples = _CHUNK_SIZE_SECONDS * sampling_rate
+    all_segments = []
+    first_info = None
+    summed_duration = 0.0
+    summed_duration_after_vad = 0.0
+
+    for start_sample in range(0, len(audio), chunk_samples):
+        chunk_offset_seconds = start_sample / sampling_rate
+        chunk_array = audio[start_sample:start_sample + chunk_samples]
+
+        segs_gen, info = _model.transcribe(chunk_array, **transcribe_kwargs)
+        for seg in segs_gen:
+            # Zeitstempel um den Start dieses Abschnitts verschieben, damit
+            # sie sich weiterhin auf die gesamte Originaldatei beziehen.
+            # Segment/Word sind dataclasses (keine namedtuples) -> dataclasses.replace().
+            shifted_words = None
+            if seg.words:
+                shifted_words = [
+                    dataclasses.replace(
+                        w, start=w.start + chunk_offset_seconds, end=w.end + chunk_offset_seconds
+                    )
+                    for w in seg.words
+                ]
+            shifted = dataclasses.replace(
+                seg,
+                start=seg.start + chunk_offset_seconds,
+                end=seg.end + chunk_offset_seconds,
+                words=shifted_words if shifted_words is not None else seg.words,
+            )
+            all_segments.append(shifted)
+
+        if first_info is None:
+            first_info = info
+        summed_duration += info.duration
+        summed_duration_after_vad += info.duration_after_vad
+
+        # Audio-Array dieses Abschnitts freigeben, bevor der nächste beginnt.
+        del chunk_array
+        gc.collect()
+
+    merged_info = _ChunkedInfo(
+        language=first_info.language if first_info else None,
+        language_probability=first_info.language_probability if first_info else 0.0,
+        duration=summed_duration,
+        duration_after_vad=summed_duration_after_vad,
+    )
+    return all_segments, merged_info
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -624,28 +743,33 @@ async def _handle_audio(
     try:
         try:
             with _inference_lock:
-                segments_gen, info = _model.transcribe(
+                # Siehe _transcribe_long_audio: lange Dateien werden intern in
+                # Abschnitten verarbeitet, um den gemessenen VAD-Speicher-
+                # spitzenwert auf dem gesamten Array zu vermeiden (~1.1 GB bei
+                # einer 73-minütigen Datei statt ~740 MB bei Abschnitten).
+                segments, info = _transcribe_long_audio(
                     tmp_path,
-                    language=lang,
-                    task=task,
-                    initial_prompt=prompt or None,
-                    temperature=temperature,
-                    beam_size=request_beam,
-                    # Word-level timing is needed internally for accurate
-                    # per-speaker segment boundaries even if the caller did
-                    # not request word timestamps in the response — a whole
-                    # Whisper segment can otherwise span several real
-                    # speaker turns (e.g. short greetings) and get blurred
-                    # onto a single speaker.
-                    word_timestamps=(wt_flag or (_diarization_enabled and diarize is not False)),
-                    vad_filter=True,
-                    # Siehe ausführlichen Kommentar bei der Streaming-Variante
-                    # oben: ohne Obergrenze kann ein einzelner, sehr langer
-                    # durchgehender Sprechabschnitt (keine natürliche Pause)
-                    # zu einem Speicher-Absturz (OOM) führen.
-                    vad_parameters={"max_speech_duration_s": 30},
+                    dict(
+                        language=lang,
+                        task=task,
+                        initial_prompt=prompt or None,
+                        temperature=temperature,
+                        beam_size=request_beam,
+                        # Word-level timing is needed internally for accurate
+                        # per-speaker segment boundaries even if the caller
+                        # did not request word timestamps in the response —
+                        # a whole Whisper segment can otherwise span several
+                        # real speaker turns (e.g. short greetings) and get
+                        # blurred onto a single speaker.
+                        word_timestamps=(wt_flag or (_diarization_enabled and diarize is not False)),
+                        vad_filter=True,
+                        # Verhindert, dass ein einzelner, sehr langer
+                        # durchgehender Sprechabschnitt (keine natürliche
+                        # Pause) für sich allein bereits zu einem
+                        # Speicher-Absturz (OOM) führt.
+                        vad_parameters={"max_speech_duration_s": 30},
+                    ),
                 )
-                segments = list(segments_gen)  # consume the generator before the temp file is removed
 
         except HTTPException:
             raise
