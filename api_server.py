@@ -184,6 +184,29 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+
+@app.middleware("http")
+async def _log_request_entry(request, call_next):
+    """
+    Diagnose-Hilfe: loggt den frühestmöglichen Zeitpunkt, zu dem eine Anfrage
+    unser ASGI-App überhaupt erreicht — NOCH VOR jeglichem Parsing von
+    Formular-/Datei-Daten durch FastAPI/Starlette. Schlägt eine Anfrage schon
+    beim Hochladen großer Dateien fehl, zeigt dieser Log-Eintrag, ob der
+    Fehler VOR oder NACH diesem Punkt passiert (z. B. in der
+    Multipart-Verarbeitung selbst, oder noch davor auf Infrastrukturebene).
+    """
+    logger.info(
+        "Anfrage eingegangen: %s %s (Content-Length: %s)",
+        request.method, request.url.path, request.headers.get("content-length", "unbekannt"),
+    )
+    try:
+        response = await call_next(request)
+        logger.info("Anfrage beendet: %s %s -> Status %s", request.method, request.url.path, response.status_code)
+        return response
+    except Exception:
+        logger.exception("Anfrage abgebrochen mit Ausnahme: %s %s", request.method, request.url.path)
+        raise
+
 # ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
