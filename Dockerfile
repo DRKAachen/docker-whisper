@@ -41,6 +41,16 @@ RUN chmod 755 /opt/src/run.sh /opt/src/manage.sh \
 
 ENV TMPDIR="/run/whisper-temp"
 
+# Sicherheitshärtung: Der Server verarbeitet nicht vertrauenswürdige,
+# von Nutzer:innen hochgeladene Dateien (über ffmpeg/faster-whisper). Läuft
+# dieser Prozess als root, hätte ein über eine präparierte Datei ausgenutzter
+# Parser-Fehler sofort volle Root-Rechte im Container. Ein dedizierter,
+# unprivilegierter Nutzer begrenzt den Schaden in diesem Fall erheblich.
+RUN groupadd -r whisper && useradd -r -g whisper -d /opt/src whisper \
+    && mkdir -p /run/whisper-temp \
+    && chown -R whisper:whisper /var/lib/whisper /run/whisper-temp
+USER whisper
+
 EXPOSE 9000/tcp
 VOLUME ["/var/lib/whisper"]
 CMD ["/opt/src/run.sh"]

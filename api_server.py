@@ -473,6 +473,7 @@ async def _handle_audio(
     beam: Optional[str],
     timestamp_granularities: Optional[List[str]] = None,
     num_speakers: Optional[int] = None,
+    diarize: Optional[bool] = None,
 ):
     """
     Shared implementation for transcription and translation endpoints.
@@ -509,8 +510,11 @@ async def _handle_audio(
     if not stream_flag and response_format not in valid_formats:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid response_format '{response_format}'. "
-                   f"Must be one of: {', '.join(sorted(valid_formats))}",
+            # Der vom Client gesendete Wert wird absichtlich NICHT in die
+            # Fehlermeldung zurückgespiegelt (auch nicht in gekürzter Form) —
+            # das verhindert, dass beliebiger, nicht vertrauenswürdiger Text
+            # unverändert in einer HTTP-Antwort landet.
+            detail=f"Invalid response_format. Must be one of: {', '.join(sorted(valid_formats))}",
         )
 
     # Resolve language: per-request param > WHISPER_LANGUAGE env var > None (autodetect)
@@ -600,7 +604,7 @@ async def _handle_audio(
                     # Whisper segment can otherwise span several real
                     # speaker turns (e.g. short greetings) and get blurred
                     # onto a single speaker.
-                    word_timestamps=(wt_flag or _diarization_enabled),
+                    word_timestamps=(wt_flag or (_diarization_enabled and diarize is not False)),
                     vad_filter=True,
                 )
                 segments = list(segments_gen)  # consume the generator before the temp file is removed
@@ -616,7 +620,7 @@ async def _handle_audio(
         # ------------------------------------------------------------------
         speaker_map = None  # {segment_index: speaker_label} — coarse fallback
         refined_segments = None  # word-accurate resegmentation, when available
-        if _diarization_enabled:
+        if _diarization_enabled and diarize is not False:
             try:
                 import diarizer
                 turns = diarizer.diarize(tmp_path, num_speakers=num_speakers)
@@ -818,6 +822,16 @@ async def transcribe(
             "only. Omit for automatic speaker-count detection."
         ),
     ),
+    diarize: Optional[bool] = Form(
+        default=None,
+        description=(
+            "Local extension: per-request override for whether diarization "
+            "runs at all, even when WHISPER_DIARIZATION=true server-wide. "
+            "Set to false to skip diarization for this call (faster — useful "
+            "for single-speaker dictation or very large files). Omit to use "
+            "the server-wide default."
+        ),
+    ),
     _auth: None = Depends(_verify_api_key),
 ):
     """
@@ -856,6 +870,7 @@ async def transcribe(
         beam=beam,
         timestamp_granularities=timestamp_granularities,
         num_speakers=num_speakers,
+        diarize=diarize,
     )
 
 
