@@ -407,6 +407,16 @@ async def _stream_sse(
                     temperature=temperature,
                     beam_size=beam_size,
                     vad_filter=True,
+                    # faster-whisper's VAD hat standardmäßig KEINE Obergrenze
+                    # für einen einzelnen, ununterbrochenen Sprechabschnitt
+                    # (max_speech_duration_s=inf). Bei langen Aufnahmen mit
+                    # minutenlangen Passagen ohne natürliche Pause (z. B.
+                    # durchgehendes Diktat) sammelt sich dadurch so viel
+                    # interner Zustand an, dass der Prozess abstürzt (OOM) —
+                    # beobachtet bei einem realen ~73-minütigen Diktat mit
+                    # einem durchgehenden ~15-minütigen Abschnitt. Eine feste
+                    # Obergrenze erzwingt einen Schnitt auch ohne Sprechpause.
+                    vad_parameters={"max_speech_duration_s": 30},
                 )
                 for seg in segs_gen:
                     loop.call_soon_threadsafe(seg_queue.put_nowait, seg)
@@ -629,6 +639,11 @@ async def _handle_audio(
                     # onto a single speaker.
                     word_timestamps=(wt_flag or (_diarization_enabled and diarize is not False)),
                     vad_filter=True,
+                    # Siehe ausführlichen Kommentar bei der Streaming-Variante
+                    # oben: ohne Obergrenze kann ein einzelner, sehr langer
+                    # durchgehender Sprechabschnitt (keine natürliche Pause)
+                    # zu einem Speicher-Absturz (OOM) führen.
+                    vad_parameters={"max_speech_duration_s": 30},
                 )
                 segments = list(segments_gen)  # consume the generator before the temp file is removed
 
