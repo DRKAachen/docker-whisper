@@ -39,7 +39,14 @@ COPY ./LICENSE.md /opt/src/LICENSE.md
 RUN chmod 755 /opt/src/run.sh /opt/src/manage.sh \
     && ln -s /opt/src/manage.sh /usr/local/bin/whisper_manage
 
-ENV TMPDIR="/run/whisper-temp"
+# WICHTIG: NICHT /run/whisper-temp verwenden. Manche Deployments (z. B. über
+# Coolifys "Custom Docker options") mounten /run als tmpfs mit begrenzter
+# Größe (z. B. --tmpfs /run:size=...). Bei sehr langen/großen Audiodateien
+# erzeugt faster-whisper währenddessen temporäre Dateien, die dieses Limit
+# überschreiten können — der Prozess stürzt dann ohne aussagekräftige
+# Fehlermeldung ab (beobachtet: "Internal Server Error", keine Logzeile).
+# Das echte Volume /var/lib/whisper unterliegt dieser Einschränkung nicht.
+ENV TMPDIR="/var/lib/whisper/tmp"
 
 # Sicherheitshärtung: Der Server verarbeitet nicht vertrauenswürdige,
 # von Nutzer:innen hochgeladene Dateien (über ffmpeg/faster-whisper). Läuft
@@ -47,8 +54,8 @@ ENV TMPDIR="/run/whisper-temp"
 # Parser-Fehler sofort volle Root-Rechte im Container. Ein dedizierter,
 # unprivilegierter Nutzer begrenzt den Schaden in diesem Fall erheblich.
 RUN groupadd -r whisper && useradd -r -g whisper -d /opt/src whisper \
-    && mkdir -p /run/whisper-temp \
-    && chown -R whisper:whisper /var/lib/whisper /run/whisper-temp
+    && mkdir -p /var/lib/whisper/tmp \
+    && chown -R whisper:whisper /var/lib/whisper
 USER whisper
 
 EXPOSE 9000/tcp

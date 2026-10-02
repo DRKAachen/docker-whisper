@@ -185,8 +185,10 @@ fi
 mkdir -p /var/lib/whisper
 # Create the dedicated temp directory for audio uploads.
 # TMPDIR is set to this path in the Dockerfile so that Python's tempfile module
-# will automatically use it, keeping transient audio data off the main filesystem.
-mkdir -p /run/whisper-temp
+# will automatically use it. This lives under the real /var/lib/whisper volume
+# (not /run, which some deployments mount as a size-limited tmpfs — large/long
+# audio files can exceed such a limit and crash the process silently).
+mkdir -p /var/lib/whisper/tmp
 
 DATA_DIR="/var/lib/whisper"
 API_KEY_FILE="${DATA_DIR}/.api_key"
