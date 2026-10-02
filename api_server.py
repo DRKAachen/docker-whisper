@@ -401,27 +401,50 @@ async def _stream_sse(
     def _run() -> None:
         with _inference_lock:
             try:
-                segs_gen, _ = _model.transcribe(
-                    tmp_path,
+                # Siehe _transcribe_long_audio weiter oben in dieser Datei für
+                # die ausführliche Begründung (gemessener Speicherverbrauch).
+                # Hier wird dieselbe Verkettungs-Logik verwendet, aber jedes
+                # Segment wird SOFORT nach Fertigstellung in die Queue gelegt
+                # (statt erst alle Abschnitte zu sammeln) — das erhält den
+                # eigentlichen Zweck des Streaming-Modus: periodisch Daten an
+                # den Client senden, damit ein zwischengeschalteter Proxy die
+                # Verbindung bei einer langen, scheinbar "stillen" Anfrage
+                # nicht wegen Inaktivität abbricht.
+                from faster_whisper.audio import decode_audio
+
+                sampling_rate = 16000
+                audio = decode_audio(tmp_path, sampling_rate=sampling_rate)
+                total_seconds = len(audio) / sampling_rate
+
+                transcribe_kwargs = dict(
                     language=lang,
                     task=task,
                     initial_prompt=prompt or None,
                     temperature=temperature,
                     beam_size=beam_size,
                     vad_filter=True,
-                    # faster-whisper's VAD hat standardmäßig KEINE Obergrenze
-                    # für einen einzelnen, ununterbrochenen Sprechabschnitt
-                    # (max_speech_duration_s=inf). Bei langen Aufnahmen mit
-                    # minutenlangen Passagen ohne natürliche Pause (z. B.
-                    # durchgehendes Diktat) sammelt sich dadurch so viel
-                    # interner Zustand an, dass der Prozess abstürzt (OOM) —
-                    # beobachtet bei einem realen ~73-minütigen Diktat mit
-                    # einem durchgehenden ~15-minütigen Abschnitt. Eine feste
-                    # Obergrenze erzwingt einen Schnitt auch ohne Sprechpause.
                     vad_parameters={"max_speech_duration_s": 30},
                 )
-                for seg in segs_gen:
-                    loop.call_soon_threadsafe(seg_queue.put_nowait, seg)
+
+                if total_seconds <= _CHUNK_THRESHOLD_SECONDS:
+                    segs_gen, _ = _model.transcribe(audio, **transcribe_kwargs)
+                    for seg in segs_gen:
+                        loop.call_soon_threadsafe(seg_queue.put_nowait, seg)
+                else:
+                    chunk_samples = _CHUNK_SIZE_SECONDS * sampling_rate
+                    for start_sample in range(0, len(audio), chunk_samples):
+                        chunk_offset_seconds = start_sample / sampling_rate
+                        chunk_array = audio[start_sample:start_sample + chunk_samples]
+                        segs_gen, _ = _model.transcribe(chunk_array, **transcribe_kwargs)
+                        for seg in segs_gen:
+                            shifted = dataclasses.replace(
+                                seg,
+                                start=seg.start + chunk_offset_seconds,
+                                end=seg.end + chunk_offset_seconds,
+                            )
+                            loop.call_soon_threadsafe(seg_queue.put_nowait, shifted)
+                        del chunk_array
+                        gc.collect()
             except Exception as exc:  # noqa: BLE001
                 loop.call_soon_threadsafe(seg_queue.put_nowait, exc)
             finally:
