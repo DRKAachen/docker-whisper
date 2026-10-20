@@ -21,6 +21,7 @@ RUN set -x \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir --uploaded-prior-to P7D \
          faster-whisper \
+         "av>=11,<19" \
          fastapi \
          "uvicorn[standard]" \
          python-multipart \

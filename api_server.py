@@ -18,6 +18,7 @@ import gc
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -57,6 +58,38 @@ _UNSUPPORTED_DIARIZE_MODEL = "gpt-4o-transcribe-diarize"
 # Serialise all inference calls (batch and streaming) so that CTranslate2 is
 # never called concurrently from multiple threads.
 _inference_lock = threading.Lock()
+
+# Abbrechen laufender Streaming-Aufträge: Auftragsnummer (Kopfzeile X-Job-Id) -> Event.
+# Der Streaming-Weg prüft das Event nach jedem Segment und zwischen den Abschnitten.
+_cancel_events: dict = {}
+_cancel_lock = threading.Lock()
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+
+class _Cancelled(Exception):
+    """Der Auftrag wurde auf Wunsch des Clients abgebrochen."""
+
+
+def _clean_job_id(value: Optional[str]) -> Optional[str]:
+    """Nur unauffällige Auftragsnummern zulassen (keine Sonderzeichen in Logs oder Verzeichnissen)."""
+    if value and _JOB_ID_RE.match(value):
+        return value
+    return None
+
+
+def _register_cancel(job_id: Optional[str]) -> threading.Event:
+    event = threading.Event()
+    if job_id:
+        with _cancel_lock:
+            _cancel_events[job_id] = event
+    return event
+
+
+def _unregister_cancel(job_id: Optional[str], event: threading.Event) -> None:
+    if job_id:
+        with _cancel_lock:
+            if _cancel_events.get(job_id) is event:
+                del _cancel_events[job_id]
 
 
 def _env_int(name: str, default: int) -> int:
@@ -379,110 +412,130 @@ async def _stream_sse(
     temperature: float,
     beam_size: int,
     task: str = "transcribe",
+    *,
+    job_id: Optional[str] = None,
+    diarize_on: bool = False,
+    num_speakers: Optional[int] = None,
+    wt_flag: bool = False,
 ):
     """
-    Async generator that yields Server-Sent Events (SSE) frames using the
-    OpenAI streaming transcription protocol.
+    Async generator that yields Server-Sent Events (SSE).
 
-    Event types emitted (see https://developers.openai.com/api/docs/guides/speech-to-text):
-      - transcript.text.delta  — incremental text as each segment is decoded
-      - transcript.text.done   — final assembled transcript
+    Event types emitted:
+      - transcript.progress    — {"duration": <Sekunden>} direkt nach dem Dekodieren (Gesamtlänge)
+      - transcript.text.delta  — {"delta", "start", "end"} je Segment, sobald es fertig ist
+                                 (OpenAI-Ereignis, start/end sind eine lokale Erweiterung)
+      - transcript.phase       — {"phase": "diarize"}: die Sprecher werden jetzt zugeordnet
+      - transcript.result      — {"result": {...}}: das vollständige Ergebnis im Format von
+                                 response_format=verbose_json, inklusive Sprecher (lokale Erweiterung)
+      - transcript.text.done   — final assembled transcript (OpenAI)
+      - transcript.cancelled   — der Auftrag wurde über /v1/jobs/{id}/cancel abgebrochen
 
     Inference runs in a thread-pool worker so the event loop stays responsive
     while the CPU-bound model decodes the audio.  _inference_lock ensures that
     only one transcription (batch or streaming) runs at a time.
 
-    The temporary audio file is deleted when the generator finishes (or is
-    abandoned by the client).
+    Wird der Auftrag abgebrochen oder trennt der Client die Verbindung, bricht der Worker
+    nach dem aktuellen Segment ab. Die temporäre Audiodatei wird am Ende immer gelöscht.
     """
     loop = asyncio.get_running_loop()
-    seg_queue: asyncio.Queue = asyncio.Queue()
+    q: asyncio.Queue = asyncio.Queue()
+    cancel_event = _register_cancel(job_id)
+
+    def put(kind, value=None) -> None:
+        loop.call_soon_threadsafe(q.put_nowait, (kind, value))
 
     def _run() -> None:
         with _inference_lock:
             try:
-                # Siehe _transcribe_long_audio weiter oben in dieser Datei für
-                # die ausführliche Begründung (gemessener Speicherverbrauch).
-                # Hier wird dieselbe Verkettungs-Logik verwendet, aber jedes
-                # Segment wird SOFORT nach Fertigstellung in die Queue gelegt
-                # (statt erst alle Abschnitte zu sammeln) — das erhält den
-                # eigentlichen Zweck des Streaming-Modus: periodisch Daten an
-                # den Client senden, damit ein zwischengeschalteter Proxy die
-                # Verbindung bei einer langen, scheinbar "stillen" Anfrage
-                # nicht wegen Inaktivität abbricht.
-                from faster_whisper.audio import decode_audio
-
-                sampling_rate = 16000
-                audio = decode_audio(tmp_path, sampling_rate=sampling_rate)
-                total_seconds = len(audio) / sampling_rate
-
+                if cancel_event.is_set():
+                    raise _Cancelled()
                 transcribe_kwargs = dict(
                     language=lang,
                     task=task,
                     initial_prompt=prompt or None,
                     temperature=temperature,
                     beam_size=beam_size,
+                    # Wortzeiten braucht die Sprecher-Zuordnung intern (wie im normalen Ablauf).
+                    word_timestamps=(wt_flag or diarize_on),
                     vad_filter=True,
                     vad_parameters={"max_speech_duration_s": 30},
                 )
+                run = _TranscribeRun(
+                    tmp_path, transcribe_kwargs,
+                    should_cancel=cancel_event.is_set,
+                    on_duration=lambda total: put("progress", total),
+                )
+                segments = []
+                for seg in run.iter_segments():
+                    segments.append(seg)
+                    put("segment", seg)
 
-                if total_seconds <= _CHUNK_THRESHOLD_SECONDS:
-                    segs_gen, _ = _model.transcribe(audio, **transcribe_kwargs)
-                    for seg in segs_gen:
-                        loop.call_soon_threadsafe(seg_queue.put_nowait, seg)
-                else:
-                    chunk_samples = _CHUNK_SIZE_SECONDS * sampling_rate
-                    for start_sample in range(0, len(audio), chunk_samples):
-                        chunk_offset_seconds = start_sample / sampling_rate
-                        chunk_array = audio[start_sample:start_sample + chunk_samples]
-                        segs_gen, _ = _model.transcribe(chunk_array, **transcribe_kwargs)
-                        for seg in segs_gen:
-                            shifted = dataclasses.replace(
-                                seg,
-                                start=seg.start + chunk_offset_seconds,
-                                end=seg.end + chunk_offset_seconds,
-                            )
-                            loop.call_soon_threadsafe(seg_queue.put_nowait, shifted)
-                        del chunk_array
-                        gc.collect()
+                speaker_map = refined_segments = None
+                if diarize_on:
+                    if cancel_event.is_set():
+                        raise _Cancelled()
+                    put("phase", "diarize")
+                    # Die Sprecher-Zuordnung selbst lässt sich nicht unterbrechen; geprüft wird davor und danach.
+                    speaker_map, refined_segments = _diarize_segments(tmp_path, segments, num_speakers)
+                    if cancel_event.is_set():
+                        raise _Cancelled()
+                result = _build_verbose_response(
+                    task, run.info, segments, speaker_map, refined_segments, wt_flag, temperature
+                )
+                put("result", result)
+            except _Cancelled:
+                put("cancelled")
             except Exception as exc:  # noqa: BLE001
-                loop.call_soon_threadsafe(seg_queue.put_nowait, exc)
+                put("error", exc)
             finally:
-                loop.call_soon_threadsafe(seg_queue.put_nowait, None)  # sentinel
+                put("end")
 
     loop.run_in_executor(None, _run)
     text_parts: list = []
 
+    def frame(payload: dict) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
     try:
         while True:
-            item = await seg_queue.get()
-            if item is None:
+            kind, value = await q.get()
+            if kind == "end":
                 break
-            if isinstance(item, Exception):
-                logger.error("Streaming transcription error: %s", item)
-                err_payload = json.dumps({
-                    "error": {
-                        "type": "transcription_error",
-                        "message": str(item),
-                    }
-                })
-                yield f"data: {err_payload}\n\n"
+            if kind == "progress":
+                yield frame({"type": "transcript.progress", "duration": round(value, 3)})
+            elif kind == "phase":
+                yield frame({"type": "transcript.phase", "phase": value})
+            elif kind == "segment":
+                seg_text = value.text.strip()
+                if seg_text:
+                    # Prepend space to separate from previous segments
+                    delta = seg_text if not text_parts else " " + seg_text
+                    text_parts.append(seg_text)
+                    yield frame({
+                        "type": "transcript.text.delta",
+                        "delta": delta,
+                        "start": round(value.start, 3),
+                        "end": round(value.end, 3),
+                    })
+            elif kind == "result":
+                yield frame({"type": "transcript.result", "result": value})
+            elif kind == "cancelled":
+                logger.info("Streaming-Auftrag abgebrochen (%s)", job_id or "ohne Nummer")
+                yield frame({"type": "transcript.cancelled"})
                 return
-            seg_text = item.text.strip()
-            if seg_text:
-                # Prepend space to separate from previous segments
-                delta = seg_text if not text_parts else " " + seg_text
-                text_parts.append(seg_text)
-                payload = json.dumps({
-                    "type": "transcript.text.delta",
-                    "delta": delta,
-                })
-                yield f"data: {payload}\n\n"
+            elif kind == "error":
+                logger.error("Streaming transcription error: %s", value)
+                yield frame({"error": {"type": "transcription_error", "message": str(value)}})
+                return
         # Final frame — complete transcript (OpenAI transcript.text.done event)
         full_text = " ".join(text_parts).strip()
-        yield f'data: {json.dumps({"type": "transcript.text.done", "text": full_text})}\n\n'
+        yield frame({"type": "transcript.text.done", "text": full_text})
         yield "data: [DONE]\n\n"
     finally:
+        # Client weg oder fertig: den Worker nicht unnötig weiterlaufen lassen.
+        cancel_event.set()
+        _unregister_cancel(job_id, cancel_event)
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -530,80 +583,212 @@ class _ChunkedInfo:
         self.duration_after_vad = duration_after_vad
 
 
+class _TranscribeRun:
+    """
+    Dekodiert die Datei EINMAL und liefert die Segmente der Reihe nach (lazy). Lange Dateien
+    werden dafür in Abschnitte zerlegt (Begründung siehe Kommentar oben, gemessener Speicherbedarf).
+    Normaler Ablauf und Streaming benutzen denselben Kern, damit sie sich nicht auseinanderentwickeln.
+
+    should_cancel: wird nach jedem Segment und vor jedem Abschnitt geprüft; True -> _Cancelled.
+    on_duration:   wird direkt nach dem Dekodieren mit der Gesamtlänge (Sekunden) aufgerufen.
+    Nach dem Durchlaufen enthält .info die Angaben zu Sprache und Dauer.
+    """
+
+    def __init__(self, tmp_path, transcribe_kwargs, should_cancel=None, on_duration=None):
+        self.tmp_path = tmp_path
+        self.kwargs = transcribe_kwargs
+        self.should_cancel = should_cancel or (lambda: False)
+        self.on_duration = on_duration
+        self.total_seconds = None
+        self.info = None
+
+    def _check(self):
+        if self.should_cancel():
+            raise _Cancelled()
+
+    def iter_segments(self):
+        from faster_whisper.audio import decode_audio
+
+        sampling_rate = 16000
+        self._check()
+        audio = decode_audio(self.tmp_path, sampling_rate=sampling_rate)
+        self.total_seconds = len(audio) / sampling_rate
+        if self.on_duration:
+            self.on_duration(self.total_seconds)
+
+        if self.total_seconds <= _CHUNK_THRESHOLD_SECONDS:
+            segments_gen, info = _model.transcribe(audio, **self.kwargs)
+            self.info = info
+            for seg in segments_gen:
+                self._check()
+                yield seg
+            return
+
+        logger.info(
+            "Lange Datei (%.1f min) wird in %d-Minuten-Abschnitten verarbeitet, "
+            "um den gemessenen VAD-Speicherspitzenwert zu vermeiden.",
+            self.total_seconds / 60, _CHUNK_SIZE_SECONDS // 60,
+        )
+        chunk_samples = _CHUNK_SIZE_SECONDS * sampling_rate
+        first_info = None
+        summed_duration = 0.0
+        summed_duration_after_vad = 0.0
+
+        for start_sample in range(0, len(audio), chunk_samples):
+            self._check()
+            chunk_offset_seconds = start_sample / sampling_rate
+            chunk_array = audio[start_sample:start_sample + chunk_samples]
+
+            segs_gen, info = _model.transcribe(chunk_array, **self.kwargs)
+            for seg in segs_gen:
+                self._check()
+                # Zeitstempel um den Start dieses Abschnitts verschieben, damit sie sich weiterhin
+                # auf die gesamte Originaldatei beziehen. Segment/Word sind dataclasses.
+                shifted_words = None
+                if seg.words:
+                    shifted_words = [
+                        dataclasses.replace(
+                            w, start=w.start + chunk_offset_seconds, end=w.end + chunk_offset_seconds
+                        )
+                        for w in seg.words
+                    ]
+                yield dataclasses.replace(
+                    seg,
+                    start=seg.start + chunk_offset_seconds,
+                    end=seg.end + chunk_offset_seconds,
+                    words=shifted_words if shifted_words is not None else seg.words,
+                )
+
+            if first_info is None:
+                first_info = info
+            summed_duration += info.duration
+            summed_duration_after_vad += info.duration_after_vad
+
+            # Audio-Array dieses Abschnitts freigeben, bevor der nächste beginnt.
+            del chunk_array
+            gc.collect()
+
+        self.info = _ChunkedInfo(
+            language=first_info.language if first_info else None,
+            language_probability=first_info.language_probability if first_info else 0.0,
+            duration=summed_duration,
+            duration_after_vad=summed_duration_after_vad,
+        )
+
+
 def _transcribe_long_audio(tmp_path: str, transcribe_kwargs: dict):
     """
-    Führt transcribe() für eine Audiodatei aus. Liegt die Dauer über
-    _CHUNK_THRESHOLD_SECONDS, wird die Datei nach dem einmaligen Dekodieren
-    in Abschnitte von _CHUNK_SIZE_SECONDS zerlegt und einzeln verarbeitet,
-    um den gemessenen VAD-Speicherspitzenwert auf langen Dateien zu
-    vermeiden. Kurze Dateien laufen unverändert über den Dateipfad, ohne
-    jeden zusätzlichen Overhead.
-
+    Normaler (nicht streamender) Ablauf: alle Segmente einsammeln.
     Gibt (segments: list, info: TranscriptionInfo | _ChunkedInfo) zurück.
     """
-    from faster_whisper.audio import decode_audio
+    run = _TranscribeRun(tmp_path, transcribe_kwargs)
+    segments = list(run.iter_segments())
+    return segments, run.info
 
-    sampling_rate = 16000
-    audio = decode_audio(tmp_path, sampling_rate=sampling_rate)
-    total_seconds = len(audio) / sampling_rate
 
-    if total_seconds <= _CHUNK_THRESHOLD_SECONDS:
-        segments_gen, info = _model.transcribe(audio, **transcribe_kwargs)
-        return list(segments_gen), info
+def _diarize_segments(tmp_path: str, segments, num_speakers: Optional[int]):
+    """
+    Sprecher-Zuordnung (optionale Nachbearbeitung). Gibt (speaker_map, refined_segments) zurück:
+      - refined_segments: wortgenaue Neu-Segmentierung (bevorzugt), sonst None
+      - speaker_map: {segment_index: speaker_label} als grober Ersatz, sonst None
+    Fällt die Zuordnung aus, kommt die Antwort ohne Sprecher zurück.
+    """
+    speaker_map = None
+    refined_segments = None
+    try:
+        import diarizer
+        turns = diarizer.diarize(tmp_path, num_speakers=num_speakers)
 
-    logger.info(
-        "Lange Datei (%.1f min) wird in %d-Minuten-Abschnitten verarbeitet, "
-        "um den gemessenen VAD-Speicherspitzenwert zu vermeiden.",
-        total_seconds / 60, _CHUNK_SIZE_SECONDS // 60,
-    )
+        # Preferred path: resegment at the word level so short
+        # interjections (greetings, "yes"/"no", etc.) that would
+        # otherwise be blurred into a longer neighbouring segment
+        # get their own, correctly-attributed entry.
+        refined_segments = diarizer.resegment_by_word(segments, turns)
 
-    chunk_samples = _CHUNK_SIZE_SECONDS * sampling_rate
-    all_segments = []
-    first_info = None
-    summed_duration = 0.0
-    summed_duration_after_vad = 0.0
+        if not refined_segments:
+            # Fallback: no word-level timing available for this
+            # request — assign one speaker per whole Whisper segment.
+            seg_dicts = [
+                {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+                for seg in segments
+            ]
+            diarizer.assign_speakers(seg_dicts, turns)
+            speaker_map = {i: d["speaker"] for i, d in enumerate(seg_dicts)}
+    except Exception as exc:
+        logger.warning("Diarization failed (returning without speakers): %s", exc)
+    return speaker_map, refined_segments
 
-    for start_sample in range(0, len(audio), chunk_samples):
-        chunk_offset_seconds = start_sample / sampling_rate
-        chunk_array = audio[start_sample:start_sample + chunk_samples]
 
-        segs_gen, info = _model.transcribe(chunk_array, **transcribe_kwargs)
-        for seg in segs_gen:
-            # Zeitstempel um den Start dieses Abschnitts verschieben, damit
-            # sie sich weiterhin auf die gesamte Originaldatei beziehen.
-            # Segment/Word sind dataclasses (keine namedtuples) -> dataclasses.replace().
-            shifted_words = None
-            if seg.words:
-                shifted_words = [
-                    dataclasses.replace(
-                        w, start=w.start + chunk_offset_seconds, end=w.end + chunk_offset_seconds
+def _build_verbose_response(task, info, segments, speaker_map, refined_segments, wt_flag, temperature) -> dict:
+    """Baut die Antwort im Format response_format=verbose_json (normaler Ablauf und Streaming-Ergebnis)."""
+    full_text = " ".join(seg.text.strip() for seg in segments).strip()
+    seg_list = []
+    all_words = []
+
+    if refined_segments is not None:
+        # Word-accurate segments: one entry per contiguous same-speaker
+        # run, rather than one per raw Whisper segment. These carry
+        # start/end/text/speaker only (the richer per-segment stats
+        # below don't apply to a resegmented run).
+        for idx, seg in enumerate(refined_segments):
+            seg_list.append({
+                "id": idx,
+                "start": round(seg["start"], 3),
+                "end": round(seg["end"], 3),
+                "text": seg["text"],
+                "speaker": seg["speaker"],
+            })
+        if wt_flag:
+            for seg in segments:
+                if seg.words:
+                    all_words.extend(
+                        {
+                            "word": w.word.strip(),
+                            "start": round(w.start, 3),
+                            "end": round(w.end, 3),
+                            "probability": round(w.probability, 4),
+                        }
+                        for w in seg.words
                     )
+    else:
+        for idx, seg in enumerate(segments):
+            seg_dict = {
+                "id": idx,
+                "seek": seg.seek,
+                "start": round(seg.start, 3),
+                "end": round(seg.end, 3),
+                "text": seg.text.strip(),
+                "tokens": seg.tokens,
+                "temperature": round(seg.temperature, 3) if seg.temperature is not None else temperature,
+                "avg_logprob": round(seg.avg_logprob, 4),
+                "compression_ratio": round(seg.compression_ratio, 4),
+                "no_speech_prob": round(seg.no_speech_prob, 4),
+            }
+            if speaker_map:
+                seg_dict["speaker"] = speaker_map.get(idx, "SPEAKER_00")
+            if wt_flag and seg.words:
+                all_words.extend(
+                    {
+                        "word": w.word.strip(),
+                        "start": round(w.start, 3),
+                        "end": round(w.end, 3),
+                        "probability": round(w.probability, 4),
+                    }
                     for w in seg.words
-                ]
-            shifted = dataclasses.replace(
-                seg,
-                start=seg.start + chunk_offset_seconds,
-                end=seg.end + chunk_offset_seconds,
-                words=shifted_words if shifted_words is not None else seg.words,
-            )
-            all_segments.append(shifted)
-
-        if first_info is None:
-            first_info = info
-        summed_duration += info.duration
-        summed_duration_after_vad += info.duration_after_vad
-
-        # Audio-Array dieses Abschnitts freigeben, bevor der nächste beginnt.
-        del chunk_array
-        gc.collect()
-
-    merged_info = _ChunkedInfo(
-        language=first_info.language if first_info else None,
-        language_probability=first_info.language_probability if first_info else 0.0,
-        duration=summed_duration,
-        duration_after_vad=summed_duration_after_vad,
-    )
-    return all_segments, merged_info
+                )
+            seg_list.append(seg_dict)
+    resp = {
+        "task": task,
+        "language": info.language,
+        "language_probability": round(info.language_probability, 4),
+        "duration": round(info.duration, 3),
+        "duration_after_vad": round(info.duration_after_vad, 3),
+        "text": full_text,
+        "segments": seg_list,
+    }
+    if wt_flag:
+        resp["words"] = all_words
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +821,25 @@ async def list_models(_auth: None = Depends(_verify_api_key)):
     }
 
 
+@app.post("/v1/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, _auth: None = Depends(_verify_api_key)):
+    """
+    Bricht einen laufenden Streaming-Auftrag ab (Nummer = Kopfzeile X-Job-Id der Anfrage).
+    Der Auftrag stoppt nach dem aktuellen Segment. Antwort: {"cancelled": true|false}
+    (false = es gibt keinen laufenden Auftrag mit dieser Nummer, z. B. weil er schon fertig ist).
+    """
+    clean = _clean_job_id(job_id)
+    if clean is None:
+        raise HTTPException(status_code=400, detail="Invalid job id.")
+    with _cancel_lock:
+        event = _cancel_events.get(clean)
+    if event is None:
+        return JSONResponse({"cancelled": False})
+    event.set()
+    logger.info("Abbruch angefordert für Auftrag %s", clean)
+    return JSONResponse({"cancelled": True})
+
+
 async def _handle_audio(
     task: str,
     file: UploadFile,
@@ -649,6 +853,7 @@ async def _handle_audio(
     timestamp_granularities: Optional[List[str]] = None,
     num_speakers: Optional[int] = None,
     diarize: Optional[bool] = None,
+    job_id: Optional[str] = None,
 ):
     """
     Shared implementation for transcription and translation endpoints.
@@ -748,11 +953,17 @@ async def _handle_audio(
     # ------------------------------------------------------------------
     # Streaming path — inference runs in a thread; temp file cleaned up
     # inside the generator when the stream ends or the client disconnects.
-    # Word timestamps are silently ignored in streaming mode.
+    # Auch hier werden Sprecher zugeordnet (am Ende, als transcript.result).
     # ------------------------------------------------------------------
     if stream_flag:
         return StreamingResponse(
-            _stream_sse(tmp_path, lang, prompt, temperature, request_beam, task),
+            _stream_sse(
+                tmp_path, lang, prompt, temperature, request_beam, task,
+                job_id=job_id,
+                diarize_on=(_diarization_enabled and diarize is not False),
+                num_speakers=num_speakers,
+                wt_flag=wt_flag,
+            ),
             media_type="text/event-stream",
             headers={
                 "X-Accel-Buffering": "no",   # disable nginx proxy buffering
@@ -806,27 +1017,7 @@ async def _handle_audio(
         speaker_map = None  # {segment_index: speaker_label} — coarse fallback
         refined_segments = None  # word-accurate resegmentation, when available
         if _diarization_enabled and diarize is not False:
-            try:
-                import diarizer
-                turns = diarizer.diarize(tmp_path, num_speakers=num_speakers)
-
-                # Preferred path: resegment at the word level so short
-                # interjections (greetings, "yes"/"no", etc.) that would
-                # otherwise be blurred into a longer neighbouring segment
-                # get their own, correctly-attributed entry.
-                refined_segments = diarizer.resegment_by_word(segments, turns)
-
-                if not refined_segments:
-                    # Fallback: no word-level timing available for this
-                    # request — assign one speaker per whole Whisper segment.
-                    seg_dicts = [
-                        {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-                        for seg in segments
-                    ]
-                    diarizer.assign_speakers(seg_dicts, turns)
-                    speaker_map = {i: d["speaker"] for i, d in enumerate(seg_dicts)}
-            except Exception as exc:
-                logger.warning("Diarization failed (returning without speakers): %s", exc)
+            speaker_map, refined_segments = _diarize_segments(tmp_path, segments, num_speakers)
 
     finally:
         # Clean up temp file after both transcription and diarization
@@ -860,73 +1051,9 @@ async def _handle_audio(
         return PlainTextResponse(_to_vtt(segments, speaker_map), media_type="text/plain")
 
     if response_format == "verbose_json":
-        seg_list = []
-        all_words = []
-
-        if refined_segments is not None:
-            # Word-accurate segments: one entry per contiguous same-speaker
-            # run, rather than one per raw Whisper segment. These carry
-            # start/end/text/speaker only (the richer per-segment stats
-            # below don't apply to a resegmented run).
-            for idx, seg in enumerate(refined_segments):
-                seg_list.append({
-                    "id": idx,
-                    "start": round(seg["start"], 3),
-                    "end": round(seg["end"], 3),
-                    "text": seg["text"],
-                    "speaker": seg["speaker"],
-                })
-            if wt_flag:
-                for seg in segments:
-                    if seg.words:
-                        all_words.extend(
-                            {
-                                "word": w.word.strip(),
-                                "start": round(w.start, 3),
-                                "end": round(w.end, 3),
-                                "probability": round(w.probability, 4),
-                            }
-                            for w in seg.words
-                        )
-        else:
-            for idx, seg in enumerate(segments):
-                seg_dict = {
-                    "id": idx,
-                    "seek": seg.seek,
-                    "start": round(seg.start, 3),
-                    "end": round(seg.end, 3),
-                    "text": seg.text.strip(),
-                    "tokens": seg.tokens,
-                    "temperature": round(seg.temperature, 3) if seg.temperature is not None else temperature,
-                    "avg_logprob": round(seg.avg_logprob, 4),
-                    "compression_ratio": round(seg.compression_ratio, 4),
-                    "no_speech_prob": round(seg.no_speech_prob, 4),
-                }
-                if speaker_map:
-                    seg_dict["speaker"] = speaker_map.get(idx, "SPEAKER_00")
-                if wt_flag and seg.words:
-                    all_words.extend(
-                        {
-                            "word": w.word.strip(),
-                            "start": round(w.start, 3),
-                            "end": round(w.end, 3),
-                            "probability": round(w.probability, 4),
-                        }
-                        for w in seg.words
-                    )
-                seg_list.append(seg_dict)
-        resp = {
-            "task": task,
-            "language": info.language,
-            "language_probability": round(info.language_probability, 4),
-            "duration": round(info.duration, 3),
-            "duration_after_vad": round(info.duration_after_vad, 3),
-            "text": full_text,
-            "segments": seg_list,
-        }
-        if wt_flag:
-            resp["words"] = all_words
-        return JSONResponse(resp)
+        return JSONResponse(
+            _build_verbose_response(task, info, segments, speaker_map, refined_segments, wt_flag, temperature)
+        )
 
     # Default: json — matches OpenAI's minimal response shape
     return JSONResponse({"text": full_text})
@@ -1017,6 +1144,14 @@ async def transcribe(
             "the server-wide default."
         ),
     ),
+    x_job_id: Optional[str] = Header(
+        default=None,
+        alias="X-Job-Id",
+        description=(
+            "Local extension: Auftragsnummer. Mit stream=true kann der laufende Auftrag darüber "
+            "per POST /v1/jobs/{id}/cancel abgebrochen werden."
+        ),
+    ),
     _auth: None = Depends(_verify_api_key),
 ):
     """
@@ -1056,6 +1191,7 @@ async def transcribe(
         timestamp_granularities=timestamp_granularities,
         num_speakers=num_speakers,
         diarize=diarize,
+        job_id=_clean_job_id(x_job_id),
     )
 
 
