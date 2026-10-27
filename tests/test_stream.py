@@ -3,6 +3,7 @@ Es läuft ein echter uvicorn-Server, damit Streaming wirklich schrittweise ankom
 Aufruf: python3 test_stream.py"""
 import asyncio
 import json
+import os
 import socket
 import sys
 import time
@@ -10,10 +11,9 @@ import time
 import httpx
 import uvicorn
 
-import os
 import harness as h
 
-ENGINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api_server.py")
+ENGINE_PATH = next(p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api_server.py"), os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_server.py")) if os.path.exists(p))
 
 AUDIO = h.wav_bytes(5)
 failed = 0

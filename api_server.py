@@ -15,6 +15,7 @@ See: https://opensource.org/licenses/MIT
 import asyncio
 import dataclasses
 import gc
+import hmac
 import json
 import logging
 import os
@@ -263,8 +264,16 @@ def _verify_api_key(authorization: Optional[str] = Header(default=None)) -> None
             status_code=401,
             detail="Invalid Authorization header. Expected: Bearer <key>",
         )
-    if parts[1] != required:
+    # Vergleich in konstanter Zeit: die Antwortzeit verrät nichts darüber, wie viele Zeichen des Schlüssels stimmen.
+    if not hmac.compare_digest(parts[1].encode("utf-8"), required.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid API key.")
+
+
+def _safe_suffix(name: Optional[str]) -> str:
+    """Endung der temporären Datei aus dem vom Browser gelieferten Namen: nur kurze, einfache Endungen.
+    Pfade, Sonderzeichen und überlange Endungen werden nie übernommen (dann: ".audio")."""
+    ext = os.path.splitext(os.path.basename(name or ""))[1]
+    return ext.lower() if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", ext or "") else ".audio"
 
 
 def _merge_form_lists(*values: Optional[List[str]]) -> Optional[List[str]]:
@@ -908,7 +917,7 @@ async def _handle_audio(
 
     # Persist uploaded bytes to a temp file so faster-whisper can open it.
     original_name = file.filename or "audio"
-    suffix = os.path.splitext(original_name)[1] or ".audio"
+    suffix = _safe_suffix(original_name)
     tmp_path: Optional[str] = None
     upload_size = 0
     try:
