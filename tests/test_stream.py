@@ -92,8 +92,15 @@ async def main():
         ev = await sse(c, srv.base, {"diarize": "true", "num_speakers": "2"}, {"X-Job-Id": "job-1"})
         t = types(ev)
         check("Streaming: Status 200 und text/event-stream", ev[0]["_status"] == 200 and "text/event-stream" in ev[0]["_ctype"], str(ev[0]))
+        # Die Sprecher-Phase kommt einmal ohne und danach mehrfach mit "progress" (Fortschritt der Zuordnung): hier zählt die Reihenfolge der Arten.
+        arts = [x for i, x in enumerate(t[1:], 1) if not (x == "transcript.phase" and i > 1 and t[i - 1] == "transcript.phase")]
         check("Streaming: Reihenfolge der Ereignisse (progress, 5x delta, phase, result, done, [DONE])",
-              t[1:] == ["transcript.progress"] + ["transcript.text.delta"] * 5 + ["transcript.phase", "transcript.result", "transcript.text.done", "[DONE]"], str(t))
+              arts == ["transcript.progress"] + ["transcript.text.delta"] * 5 + ["transcript.phase", "transcript.result", "transcript.text.done", "[DONE]"], str(t))
+        phases = [e for e in ev if isinstance(e, dict) and e.get("type") == "transcript.phase"]
+        pr = [e["progress"] for e in phases if "progress" in e]
+        check("Sprecher-Phase: das erste Ereignis hat keinen Fortschritt, danach steigt 'progress' gleichmäßig bis 1.0",
+              "progress" not in phases[0] and len(pr) >= 10 and all(b >= a for a, b in zip(pr, pr[1:])) and pr[-1] == 1.0 and all(e["phase"] == "diarize" for e in phases), str(phases[:3]))
+        check("Sprecher-Phase: höchstens etwa 100 Meldungen (nie ein Ereignis pro Rechenschritt)", len(pr) <= 101, len(pr))
         prog = ev[1]
         check("Fortschritt: Gesamtlänge der Datei (5 s) kommt VOR dem ersten Text", prog["duration"] == 5.0, str(prog))
         deltas = [e for e in ev if isinstance(e, dict) and e.get("type") == "transcript.text.delta"]

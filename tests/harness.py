@@ -65,9 +65,22 @@ def make_fake_diarizer(delay=0.0, fail=False):
     mod = types.ModuleType("diarizer")
     mod.calls = []
 
-    def diarize(path, num_speakers=None):
+    class DiarizationAborted(Exception):
+        pass
+
+    mod.DiarizationAborted = DiarizationAborted
+
+    def diarize(path, num_speakers=None, progress=None):
         mod.calls.append(("diarize", num_speakers))
-        if delay:
+        if progress is not None:
+            # Wie die echte Erkennung: gleichmäßig von 0 bis 1 melden, bei True sofort abbrechen
+            steps = max(1, int(round(delay / 0.02))) if delay else 20
+            for i in range(1, steps + 1):
+                if progress(i / steps):
+                    raise DiarizationAborted()
+                if delay:
+                    time.sleep(delay / steps)
+        elif delay:
             time.sleep(delay)
         if fail:
             raise RuntimeError("Diarisierung kaputt")

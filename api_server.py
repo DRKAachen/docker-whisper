@@ -16,6 +16,7 @@ import asyncio
 import dataclasses
 import gc
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -51,8 +52,16 @@ _model_name = None  # name as loaded (e.g. "base")
 _beam_size = 5      # beam size used for transcription
 _max_request_beam = 10  # maximum per-request beam override; 0 disables the cap
 _word_timestamps = False  # default for word-level timestamps
+# Gegen Wiederholungsschleifen ("... bei der Kuhnjahme bei der Kuhnjahme ..."): Whisper darf bei unsicheren oder zu stark
+# wiederholten Abschnitten mit höherer Temperatur neu ansetzen, und ein misslungener Abschnitt wird nicht zur Vorlage für den
+# nächsten. WHISPER_CONDITION_ON_PREVIOUS_TEXT=true stellt das frühere Verhalten (Text davor als Vorlage) wieder her.
+_condition_on_previous = os.environ.get("WHISPER_CONDITION_ON_PREVIOUS_TEXT", "false").strip().lower() == "true"
+_TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)  # dieselben Stufen wie im Standard von faster-whisper
 _diarization_enabled = False  # set via WHISPER_DIARIZATION=true
 _max_upload_bytes = 1024 * 1024 * 1024  # 1 GiB by default; 0 disables the limit
+# Obergrenze der Audiodauer in Minuten (0 = unbegrenzt). Die ganze Datei wird als Zahlenreihe in den Speicher dekodiert: eine
+# stark komprimierte Datei von vielen Stunden würde den Speicher füllen und das Moteur beenden.
+_max_duration_min = 240
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
 _UNSUPPORTED_DIARIZE_MODEL = "gpt-4o-transcribe-diarize"
 
@@ -139,11 +148,17 @@ def _load_diarizer() -> None:
         cache_dir = os.environ.get("HF_HOME", "/var/lib/whisper")
         num_speakers = _env_int("WHISPER_DIARIZE_NUM_SPEAKERS", -1)
         threshold = _env_float("WHISPER_DIARIZE_THRESHOLD", 0.5)
+        # Modell der Stimm-Merkmale: "eres2net" (Standard, wie bisher) oder "campplus" (in einem Test etwa doppelt so schnell).
+        embedding = os.environ.get("WHISPER_DIARIZE_EMBEDDING", "").strip().lower() or "eres2net"
+        # Threads der Sprecher-Erkennung: ohne Angabe alle Kerne des Containers, höchstens 8 (sherpa-onnx würde sonst nur EINEN nutzen).
+        threads = _env_int("WHISPER_DIARIZE_THREADS", 0)
         logger.info("Loading diarization pipeline...")
         diarizer.load(
             cache_dir=cache_dir,
             num_speakers=num_speakers,
             cluster_threshold=threshold,
+            embedding=embedding,
+            num_threads=threads if threads > 0 else None,
         )
         _diarization_enabled = True
         logger.info("Diarization enabled.")
@@ -154,7 +169,7 @@ def _load_diarizer() -> None:
 
 def _load_model() -> None:
     """Import and initialise the faster-whisper model from environment config."""
-    global _model, _model_name, _beam_size, _max_request_beam, _word_timestamps, _max_upload_bytes
+    global _model, _model_name, _beam_size, _max_request_beam, _word_timestamps, _max_upload_bytes, _max_duration_min
 
     from faster_whisper import WhisperModel  # deferred — keeps import fast
 
@@ -181,10 +196,20 @@ def _load_model() -> None:
         )
         max_upload_mb = 1024
     _max_upload_bytes = max_upload_mb * 1024 * 1024
+    max_duration_min = _env_int("WHISPER_MAX_DURATION_MIN", 240)
+    if max_duration_min < 0:
+        logger.warning("Invalid value for WHISPER_MAX_DURATION_MIN: %d (expected 0 or greater); using default 240", max_duration_min)
+        max_duration_min = 240
+    _max_duration_min = max_duration_min
+    logger.info("Limits | max_upload_mb=%d max_duration_min=%d docs=%s", max_upload_mb, _max_duration_min, _docs_enabled)
 
     logger.info(
         "Loading model '%s' | device=%s compute_type=%s threads=%d beam=%d max_request_beam=%d word_ts=%s max_upload_mb=%d local_only=%s cache=%s",
         model_name, device, compute_type, threads, _beam_size, _max_request_beam, _word_timestamps, max_upload_mb, local_files_only, cache_dir,
+    )
+    logger.info(
+        "Decoding | temperature_fallback=%s condition_on_previous_text=%s compression_ratio_threshold=2.4",
+        list(_TEMPERATURE_FALLBACK), _condition_on_previous,
     )
     t0 = time.monotonic()
     _model = WhisperModel(
@@ -210,7 +235,14 @@ async def _lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 
+# Die interaktive API-Dokumentation (/docs, /redoc, /openapi.json) ist ohne Schlüssel abrufbar und verrät die ganze Schnittstelle.
+# Standardmäßig aus; WHISPER_ENABLE_DOCS=true schaltet sie für die Entwicklung ein.
+_docs_enabled = os.environ.get("WHISPER_ENABLE_DOCS", "").strip().lower() in ("1", "true", "yes", "on")
+
 app = FastAPI(
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
     title="Whisper Speech-to-Text",
     description=(
         "OpenAI-compatible speech-to-text API powered by faster-whisper.\n\n"
@@ -238,6 +270,10 @@ async def _log_request_entry(request, call_next):
     try:
         response = await call_next(request)
         logger.info("Anfrage beendet: %s %s -> Status %s", request.method, request.url.path, response.status_code)
+        # Antworten werden nie zwischengespeichert oder anders gedeutet (Zwischenspeicher-Header des Streams bleiben unberührt)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
         return response
     except Exception:
         logger.exception("Anfrage abgebrochen mit Ausnahme: %s %s", request.method, request.url.path)
@@ -330,6 +366,63 @@ def _validate_openai_transcription_compat(
         raise HTTPException(
             status_code=400,
             detail="known_speaker_references is not supported; local diarization does not accept speaker reference audio.",
+        )
+
+
+def _decode_options(temperature: float) -> dict:
+    """Einstellungen der Whisper-Entschlüsselung, die Wiederholungsschleifen vorbeugen.
+
+    Die Anfrage schickt standardmäßig temperature=0. Ein einzelner Wert schaltet die Ersatzversuche von faster-whisper ab, und eine
+    Schleife bleibt dann bis zum Ende der Datei bestehen. Bei 0 gilt deshalb die Standardfolge 0, 0.2 ... 1.0: ein Abschnitt, der zu
+    stark wiederholt (compression_ratio über 2,4) oder zu unsicher ist, wird mit höherer Temperatur neu berechnet. Ein ausdrücklich
+    angegebener Wert über 0 wird unverändert verwendet."""
+    return {
+        "temperature": list(_TEMPERATURE_FALLBACK) if temperature == 0 else temperature,
+        "condition_on_previous_text": _condition_on_previous,
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
+    }
+
+
+def _probe_duration(path: str, cap_seconds: float):
+    """Dauer der Audiodatei in Sekunden, ohne sie ganz zu dekodieren: aus dem Dateikopf. Fehlt die Angabe, wird bis höchstens
+    cap_seconds mitgezählt (dann genügt "länger als erlaubt"). None, wenn die Datei nicht lesbar ist (der normale Weg meldet dann
+    seinen eigenen Fehler)."""
+    try:
+        import av
+        with av.open(path, metadata_errors="ignore") as container:
+            if container.duration:  # Mikrosekunden
+                return container.duration / 1_000_000
+            stream = next((s for s in container.streams if s.type == "audio"), None)
+            if stream is None:
+                return None
+            if stream.duration and stream.time_base:
+                return float(stream.duration * stream.time_base)
+            counted = 0.0
+            for frame in container.decode(stream):
+                counted += frame.samples / frame.sample_rate
+                if counted > cap_seconds:
+                    break
+            return counted
+    except Exception:
+        return None
+
+
+def _check_duration_limit(tmp_path: str) -> None:
+    """Löscht die Datei und lehnt mit 413 ab, wenn sie länger als WHISPER_MAX_DURATION_MIN ist."""
+    if not _max_duration_min:
+        return
+    limit_s = _max_duration_min * 60
+    duration = _probe_duration(tmp_path, limit_s)
+    if duration is not None and duration > limit_s:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio is too long ({duration / 60:.0f} min). Maximum allowed duration is {_max_duration_min} minutes.",
         )
 
 
@@ -463,7 +556,7 @@ async def _stream_sse(
                     language=lang,
                     task=task,
                     initial_prompt=prompt or None,
-                    temperature=temperature,
+                    **_decode_options(temperature),
                     beam_size=beam_size,
                     # Wortzeiten braucht die Sprecher-Zuordnung intern (wie im normalen Ablauf).
                     word_timestamps=(wt_flag or diarize_on),
@@ -485,8 +578,20 @@ async def _stream_sse(
                     if cancel_event.is_set():
                         raise _Cancelled()
                     put("phase", "diarize")
-                    # Die Sprecher-Zuordnung selbst lässt sich nicht unterbrechen; geprüft wird davor und danach.
-                    speaker_map, refined_segments = _diarize_segments(tmp_path, segments, num_speakers)
+                    last_p = {"v": -1.0}
+
+                    def on_diar_progress(frac: float) -> bool:
+                        """Meldet den Fortschritt der Sprecher-Zuordnung (höchstens alle 1 %) und stoppt sie, wenn abgebrochen wurde."""
+                        if cancel_event.is_set():
+                            return True
+                        if frac - last_p["v"] >= 0.01 or frac >= 1.0:
+                            last_p["v"] = frac
+                            put("diar_progress", frac)
+                        return False
+
+                    speaker_map, refined_segments = _diarize_segments(
+                        tmp_path, segments, num_speakers, progress=on_diar_progress
+                    )
                     if cancel_event.is_set():
                         raise _Cancelled()
                 result = _build_verbose_response(
@@ -515,6 +620,9 @@ async def _stream_sse(
                 yield frame({"type": "transcript.progress", "duration": round(value, 3)})
             elif kind == "phase":
                 yield frame({"type": "transcript.phase", "phase": value})
+            elif kind == "diar_progress":
+                # Alte Frontends lesen nur "phase" und ignorieren "progress".
+                yield frame({"type": "transcript.phase", "phase": "diarize", "progress": round(value, 3)})
             elif kind == "segment":
                 seg_text = value.text.strip()
                 if seg_text:
@@ -622,6 +730,9 @@ class _TranscribeRun:
         self._check()
         audio = decode_audio(self.tmp_path, sampling_rate=sampling_rate)
         self.total_seconds = len(audio) / sampling_rate
+        if _max_duration_min and self.total_seconds > _max_duration_min * 60 * 1.02:
+            # Zweite Sicherung: der Dateikopf kann falsche Angaben machen
+            raise ValueError(f"Audio is too long ({self.total_seconds / 60:.0f} min). Maximum allowed duration is {_max_duration_min} minutes.")
         if self.on_duration:
             self.on_duration(self.total_seconds)
 
@@ -695,7 +806,7 @@ def _transcribe_long_audio(tmp_path: str, transcribe_kwargs: dict):
     return segments, run.info
 
 
-def _diarize_segments(tmp_path: str, segments, num_speakers: Optional[int]):
+def _diarize_segments(tmp_path: str, segments, num_speakers: Optional[int], progress=None):
     """
     Sprecher-Zuordnung (optionale Nachbearbeitung). Gibt (speaker_map, refined_segments) zurück:
       - refined_segments: wortgenaue Neu-Segmentierung (bevorzugt), sonst None
@@ -706,7 +817,10 @@ def _diarize_segments(tmp_path: str, segments, num_speakers: Optional[int]):
     refined_segments = None
     try:
         import diarizer
-        turns = diarizer.diarize(tmp_path, num_speakers=num_speakers)
+        if progress is not None and "progress" in inspect.signature(diarizer.diarize).parameters:
+            turns = diarizer.diarize(tmp_path, num_speakers=num_speakers, progress=progress)
+        else:  # ältere diarizer.py ohne Fortschritt
+            turns = diarizer.diarize(tmp_path, num_speakers=num_speakers)
 
         # Preferred path: resegment at the word level so short
         # interjections (greetings, "yes"/"no", etc.) that would
@@ -724,6 +838,8 @@ def _diarize_segments(tmp_path: str, segments, num_speakers: Optional[int]):
             diarizer.assign_speakers(seg_dicts, turns)
             speaker_map = {i: d["speaker"] for i, d in enumerate(seg_dicts)}
     except Exception as exc:
+        if type(exc).__name__ == "DiarizationAborted":
+            raise _Cancelled() from None  # auf Wunsch abgebrochen: kein Fehler, der Auftrag endet als abgebrochen
         logger.warning("Diarization failed (returning without speakers): %s", exc)
     return speaker_map, refined_segments
 
@@ -959,6 +1075,8 @@ async def _handle_audio(
         original_name, upload_size, lang or "auto", response_format, stream_flag, request_beam, wt_flag,
     )
 
+    _check_duration_limit(tmp_path)
+
     # ------------------------------------------------------------------
     # Streaming path — inference runs in a thread; temp file cleaned up
     # inside the generator when the stream ends or the client disconnects.
@@ -996,7 +1114,7 @@ async def _handle_audio(
                         language=lang,
                         task=task,
                         initial_prompt=prompt or None,
-                        temperature=temperature,
+                        **_decode_options(temperature),
                         beam_size=request_beam,
                         # Word-level timing is needed internally for accurate
                         # per-speaker segment boundaries even if the caller

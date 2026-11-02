@@ -12,10 +12,12 @@ This work is licensed under the MIT License
 See: https://opensource.org/licenses/MIT
 """
 
+import hashlib
 import logging
 import os
 import subprocess
 import tarfile
+import time
 
 import numpy as np
 import sherpa_onnx
@@ -30,14 +32,94 @@ _SEG_MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
     "speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
 )
-_EMB_MODEL_URL = (
+_EMB_RELEASE_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
     "speaker-recongition-models/"
-    "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
 )
 
+# Speaker-embedding models. "eres2net" is the original default. "campplus" is about 3x faster per
+# embedding (measured: ~130 ms vs ~394 ms per 10 s of audio on one core); pick it with
+# WHISPER_DIARIZE_EMBEDDING=campplus, then compare the speaker labels on your own recordings.
+_EMB_MODELS = {
+    "eres2net": "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+    "campplus": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+}
+
 _SEG_MODEL_REL = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
-_EMB_MODEL_REL = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+_SEG_ARCHIVE = "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+
+# SHA-256 of every model file, taken from the official k2-fsa/sherpa-onnx release assets. A downloaded or cached file that does not
+# match is deleted and refused (a model is code-like input for the ONNX runtime: a swapped file must never be loaded).
+# WHISPER_DIARIZE_SKIP_CHECKSUM=true switches the check off (e.g. if upstream re-publishes a model); this is logged loudly.
+_SHA256 = {
+    _SEG_ARCHIVE: "24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488",
+    _SEG_MODEL_REL: "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+    "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx": "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b",
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+}
+
+
+def _sha256_of(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _verify_file(path: str, key: str) -> None:
+    """Raise RuntimeError (and delete the file) if the file does not match its pinned SHA-256."""
+    if os.environ.get("WHISPER_DIARIZE_SKIP_CHECKSUM", "").strip().lower() in ("1", "true", "yes", "on"):
+        logger.warning("Checksum check SKIPPED for %s (WHISPER_DIARIZE_SKIP_CHECKSUM is set)", key)
+        return
+    expected = _SHA256.get(key)
+    if not expected:
+        raise RuntimeError(f"No pinned checksum for {key}")
+    actual = _sha256_of(path)
+    if actual != expected:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Checksum mismatch for {key} (expected {expected[:12]}..., got {actual[:12]}...); the file was deleted and not loaded"
+        )
+
+
+class DiarizationAborted(Exception):
+    """Raised when the caller asked to stop (the progress callback returned True)."""
+
+
+# Values given to load() (the server passes the WHISPER_DIARIZE_* settings); None = use the environment / defaults.
+_cfg_embedding = None
+_cfg_threads = None
+
+
+def _embedding_name() -> str:
+    name = (_cfg_embedding or os.environ.get("WHISPER_DIARIZE_EMBEDDING", "") or "eres2net").strip().lower()
+    if name not in _EMB_MODELS:
+        logger.warning(
+            "Diarization embedding model %r is unknown, using 'eres2net' (allowed: %s)",
+            name, ", ".join(_EMB_MODELS),
+        )
+        return "eres2net"
+    return name
+
+
+def _num_threads() -> int:
+    """CPU threads for the ONNX sessions. sherpa-onnx defaults to ONE thread, which leaves
+    every other core idle on long recordings. Order: the value given to load(), then
+    WHISPER_DIARIZE_THREADS, otherwise all cores available to the container, at most 8."""
+    if isinstance(_cfg_threads, int) and _cfg_threads > 0:
+        return min(_cfg_threads, 32)
+    raw = os.environ.get("WHISPER_DIARIZE_THREADS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return min(int(raw), 32)
+    try:
+        cpus = len(os.sched_getaffinity(0))  # respects cpuset limits of the container
+    except AttributeError:  # not available on every platform
+        cpus = os.cpu_count() or 1
+    return max(1, min(cpus, 8))
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -62,18 +144,22 @@ def _download_file(url: str, dest: str) -> None:
 def _ensure_models(cache_dir: str) -> tuple:
     """Download ONNX models if not already present. Returns (seg_path, emb_path)."""
     seg_path = os.path.join(cache_dir, _SEG_MODEL_REL)
-    emb_path = os.path.join(cache_dir, _EMB_MODEL_REL)
+    emb_file = _EMB_MODELS[_embedding_name()]
+    emb_path = os.path.join(cache_dir, emb_file)
 
     if not os.path.isfile(seg_path):
-        archive = os.path.join(cache_dir, "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2")
+        archive = os.path.join(cache_dir, _SEG_ARCHIVE)
         _download_file(_SEG_MODEL_URL, archive)
+        _verify_file(archive, _SEG_ARCHIVE)  # check BEFORE unpacking
         logger.info("Extracting segmentation model...")
         with tarfile.open(archive, "r:bz2") as tar:
             tar.extractall(path=cache_dir, filter="data")
         os.unlink(archive)
+    _verify_file(seg_path, _SEG_MODEL_REL)  # also for a model that was cached by an earlier start
 
     if not os.path.isfile(emb_path):
-        _download_file(_EMB_MODEL_URL, emb_path)
+        _download_file(_EMB_RELEASE_URL + emb_file, emb_path)
+    _verify_file(emb_path, emb_file)
 
     return seg_path, emb_path
 
@@ -82,9 +168,16 @@ def load(
     cache_dir: str = "/var/lib/whisper",
     num_speakers: int = -1,
     cluster_threshold: float = 0.5,
+    embedding: str = None,
+    num_threads: int = None,
 ) -> None:
-    """Download ONNX models if needed, initialize the diarization pipeline."""
-    global _sd, _seg_path, _emb_path, _default_threshold
+    """Download ONNX models if needed, initialize the diarization pipeline.
+
+    embedding: "eres2net" (default) or "campplus" (about 3x faster per embedding).
+    num_threads: CPU threads for the ONNX sessions (default: see _num_threads).
+    """
+    global _sd, _seg_path, _emb_path, _default_threshold, _cfg_embedding, _cfg_threads
+    _cfg_embedding, _cfg_threads = embedding, num_threads
 
     seg_path, emb_path = _ensure_models(cache_dir)
     _seg_path, _emb_path = seg_path, emb_path
@@ -92,10 +185,12 @@ def load(
 
     _sd = _build_pipeline(seg_path, emb_path, num_speakers, cluster_threshold)
     logger.info(
-        "Diarization pipeline ready (sample_rate=%d, num_clusters=%d, threshold=%.2f)",
+        "Diarization pipeline ready (sample_rate=%d, num_clusters=%d, threshold=%.2f, threads=%d, embedding=%s)",
         _sd.sample_rate,
         num_speakers if num_speakers > 0 else -1,
         cluster_threshold,
+        _num_threads(),
+        _embedding_name(),
     )
 
 
@@ -106,14 +201,16 @@ def _build_pipeline(seg_path: str, emb_path: str, num_speakers: int, cluster_thr
     config. Used both at startup and, when a caller asks for a different
     speaker count, per individual request."""
     num_clusters = num_speakers if num_speakers and num_speakers > 0 else -1
+    threads = _num_threads()
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
             pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                 model=seg_path,
             ),
+            num_threads=threads,
         ),
-        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb_path),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb_path, num_threads=threads),
         clustering=sherpa_onnx.FastClusteringConfig(
             num_clusters=num_clusters,
             threshold=cluster_threshold,
@@ -167,7 +264,7 @@ def _load_audio(audio_path: str, target_sr: int = 16000):
     return audio
 
 
-def diarize(audio_path: str, num_speakers: int = None):
+def diarize(audio_path: str, num_speakers: int = None, progress=None):
     """
     Run diarization on an audio file.
 
@@ -179,18 +276,37 @@ def diarize(audio_path: str, num_speakers: int = None):
     relying on a single server-wide guess, which tends to over-split a
     single voice into many spurious speakers on long or noisy recordings.
 
+    progress: optional callable progress(fraction) -> bool. It is called with a value from 0.0
+    to 1.0 while the work runs; if it returns True the work stops at the next step and
+    DiarizationAborted is raised (the pipeline object stays usable afterwards).
+
     Returns a list of (start, end, speaker_label) tuples sorted by start time.
     """
     if _sd is None:
         raise RuntimeError("Diarizer not loaded. Call diarizer.load() first.")
 
+    t_start = time.monotonic()
+
+    def report(fraction: float) -> None:
+        if progress is not None and progress(min(1.0, max(0.0, fraction))):
+            raise DiarizationAborted()
+
     pipeline = _sd
     if num_speakers is not None and num_speakers > 0:
         pipeline = _build_pipeline(_seg_path, _emb_path, num_speakers, _default_threshold)
 
+    report(0.0)
     audio = _load_audio(audio_path, target_sr=pipeline.sample_rate)
+    t_loaded = time.monotonic()
+    report(0.0)
 
-    result = pipeline.process(audio).sort_by_start_time()
+    def on_chunk(done, total):
+        # The embedding step is the bulk of the work (~90 %): report 0 - 95 % while it runs.
+        report(0.95 * done / total if total else 0.0)
+        return 0
+
+    result = pipeline.process(audio, callback=on_chunk if progress is not None else None).sort_by_start_time()
+    t_processed = time.monotonic()
     turns = []
     for r in result:
         turns.append((r.start, r.end, f"SPEAKER_{r.speaker:02d}"))
@@ -205,20 +321,30 @@ def diarize(audio_path: str, num_speakers: int = None):
     # to often merge a short reply into whichever speaker merely happened
     # to talk nearby in time, rather than the speaker who actually said it.
     turns = _merge_sliver_speakers_by_voice(turns, audio, pipeline.sample_rate)
+    report(1.0)
+    logger.info(
+        "Diarization done: %.0f s of audio, %d turns, %d speakers in %.1f s (load %.1f s, analyse %.1f s, clean-up %.1f s, threads=%d)",
+        len(audio) / pipeline.sample_rate, len(turns), len({t[2] for t in turns}),
+        time.monotonic() - t_start, t_loaded - t_start, t_processed - t_loaded,
+        time.monotonic() - t_processed, _num_threads(),
+    )
     return turns
 
 
 def _get_embedding_extractor():
     global _embedding_extractor
     if _embedding_extractor is None:
-        cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=_emb_path)
+        cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=_emb_path, num_threads=_num_threads())
         _embedding_extractor = sherpa_onnx.SpeakerEmbeddingExtractor(cfg)
     return _embedding_extractor
 
 
-def _embed_segment(audio, sample_rate, start, end):
+def _embed_segment(audio, sample_rate, start, end, max_seconds: float = 10.0):
     extractor = _get_embedding_extractor()
     stream = extractor.create_stream()
+    if end - start > max_seconds:  # a 10 s sample is enough to characterise a voice; long turns only cost time
+        middle = (start + end) / 2
+        start, end = middle - max_seconds / 2, middle + max_seconds / 2
     chunk = audio[int(start * sample_rate):int(end * sample_rate)]
     stream.accept_waveform(sample_rate=sample_rate, waveform=chunk)
     stream.input_finished()
@@ -232,6 +358,7 @@ def _cosine_sim(a, b):
 
 def _merge_sliver_speakers_by_voice(
     turns, audio, sample_rate, min_total_seconds: float = 1.5, min_share: float = 0.08,
+    max_turns_per_speaker: int = 12,
 ):
     """
     Fold speakers with very little total talk time into whichever other
@@ -259,13 +386,15 @@ def _merge_sliver_speakers_by_voice(
     if not main_speakers:
         return turns  # everything is a "sliver" (very short clip) — nothing sensible to merge into
 
-    # Centroid embedding per main (non-sliver) speaker, averaged over all
-    # of that speaker's turns.
+    # Centroid embedding per main (non-sliver) speaker. Averaged over the speaker's longest turns
+    # only (at most max_turns_per_speaker): on a long recording a speaker can have thousands of
+    # turns, and embedding every one of them took minutes for a result that barely changes.
     centroids = {}
     for spk in main_speakers:
+        own = sorted((t for t in turns if t[2] == spk), key=lambda t: t[1] - t[0], reverse=True)
         embs = [
             _embed_segment(audio, sample_rate, s, e)
-            for s, e, sp in turns if sp == spk
+            for s, e, _sp in own[:max_turns_per_speaker]
         ]
         centroids[spk] = np.mean(embs, axis=0)
 
