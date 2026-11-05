@@ -17,13 +17,23 @@ import dataclasses
 import gc
 import hmac
 import inspect
+import io
 import json
 import logging
 import os
 import re
+import socket
+import ssl
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -202,6 +212,13 @@ def _load_model() -> None:
         max_duration_min = 240
     _max_duration_min = max_duration_min
     logger.info("Limits | max_upload_mb=%d max_duration_min=%d docs=%s", max_upload_mb, _max_duration_min, _docs_enabled)
+    gateway_cfg = _gateway_config()
+    if gateway_cfg:
+        logger.info("Backend | gateway host=%s model=%s chunk=%.0fs parallel=%d fallback=%s vad=%s",
+                    gateway_cfg["host"], gateway_cfg["model"], gateway_cfg["chunk_s"], gateway_cfg["parallel"],
+                    gateway_cfg["fallback"], gateway_cfg["vad"])
+    else:
+        logger.info("Backend | local")
 
     logger.info(
         "Loading model '%s' | device=%s compute_type=%s threads=%d beam=%d max_request_beam=%d word_ts=%s max_upload_mb=%d local_only=%s cache=%s",
@@ -687,6 +704,243 @@ _CHUNK_THRESHOLD_SECONDS = _env_int("WHISPER_CHUNK_THRESHOLD_SECONDS", 900)  # 1
 _CHUNK_SIZE_SECONDS = _env_int("WHISPER_CHUNK_SIZE_SECONDS", 600)  # 10 min
 
 
+# ---------------------------------------------------------------------------
+# Optional: Spracherkennung über ein Gateway (LiteLLM/vLLM, OpenAI-kompatibel) statt auf diesem Rechner.
+# WHISPER_BACKEND=gateway schaltet es ein. Die Aufnahme wird in Stücke von höchstens 28 Sekunden geschnitten (ein
+# Whisper-Fenster, dadurch stimmen die Zeitstempel und jede Anfrage bleibt klein), die Stücke laufen mehrere gleichzeitig.
+# Bei einem Fehler läuft der Rest auf dem lokalen Modell (GATEWAY_FALLBACK=false schaltet das ab).
+# Der Schlüssel steht nur in der Umgebung dieses Prozesses; er wird nie protokolliert und nie an einen anderen Rechner
+# weitergegeben (Weiterleitungen werden abgelehnt).
+# ---------------------------------------------------------------------------
+_GW_RATE = 16000
+_GW_RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+_GW_MAX_RESPONSE = 8 * 1024 * 1024
+_gw_warned: set = set()
+_gw_vad_lock = threading.Lock()  # die Erkennung wird nie von zwei Threads gleichzeitig benutzt (Vorsicht bei anderen Bibliotheksversionen)
+
+
+class _GatewayError(Exception):
+    """Fehler beim Gateway. Die Meldung ist bereinigt und enthält nie den Schlüssel."""
+
+
+def _gw_warn_once(key: str, message: str, *args) -> None:
+    if key not in _gw_warned:
+        _gw_warned.add(key)
+        logger.warning(message, *args)
+
+
+def _gw_flag(name: str, default: bool) -> bool:
+    val = os.environ.get(name, "").strip().lower()
+    return default if not val else val in ("1", "true", "yes", "on")
+
+
+def _gateway_config():
+    """Liest die Einstellungen bei jedem Aufruf. None heißt: lokaler Weg (nicht eingeschaltet oder unvollständig/unsicher)."""
+    if os.environ.get("WHISPER_BACKEND", "local").strip().lower() != "gateway":
+        return None
+    url = os.environ.get("GATEWAY_URL", "").strip().rstrip("/")
+    key = os.environ.get("GATEWAY_API_KEY", "").strip()
+    if not url or not key:
+        _gw_warn_once("missing", "WHISPER_BACKEND=gateway, but GATEWAY_URL or GATEWAY_API_KEY is missing; using the local model")
+        return None
+    parsed = urllib.parse.urlparse(url)
+    local_host = parsed.hostname in ("localhost", "127.0.0.1", "::1")
+    if not parsed.hostname or not (parsed.scheme == "https" or (parsed.scheme == "http" and (local_host or _gw_flag("GATEWAY_ALLOW_HTTP", False)))):
+        _gw_warn_once("scheme", "GATEWAY_URL must be an https address (the audio would travel unencrypted); using the local model")
+        return None
+    if "/audio/transcriptions" in parsed.path:
+        endpoint = url
+    elif parsed.path.endswith("/v1"):
+        endpoint = url + "/audio/transcriptions"
+    else:
+        endpoint = url + "/v1/audio/transcriptions"
+    return {
+        "endpoint": endpoint,
+        "host": parsed.hostname,
+        "key": key,
+        "model": os.environ.get("GATEWAY_MODEL", "whisper-large-v3-turbo").strip() or "whisper-large-v3-turbo",
+        "chunk_s": min(max(_env_float("GATEWAY_CHUNK_SECONDS", 28.0), 10.0), 29.0),
+        "parallel": min(max(_env_int("GATEWAY_PARALLEL", 3), 1), 8),
+        "timeout": max(_env_float("GATEWAY_TIMEOUT_S", 300.0), 5.0),
+        "retries": min(max(_env_int("GATEWAY_RETRIES", 2), 0), 5),
+        "backoff": max(_env_float("GATEWAY_RETRY_BACKOFF", 1.5), 0.0),
+        "fallback": _gw_flag("GATEWAY_FALLBACK", True),
+        "word_ts": _gw_flag("GATEWAY_WORD_TIMESTAMPS", False),
+        "vad": _gw_flag("GATEWAY_VAD", True),
+        "language": (os.environ.get("GATEWAY_LANGUAGE", "").strip().lower() or None),
+    }
+
+
+def _gw_clean(text, key: str) -> str:
+    text = " ".join(str(text).split())
+    if key:
+        text = text.replace(key, "***")
+    return text[:200]
+
+
+def _gw_wav(samples) -> bytes:
+    import numpy as np
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(_GW_RATE)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def _gw_multipart(fields, filename: str, data: bytes):
+    boundary = uuid.uuid4().hex
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode("utf-8") for n, v in fields]
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: audio/wav\r\n\r\n'.encode("utf-8")
+    )
+    parts.append(data)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Weiterleitungen werden nicht befolgt: sonst ginge der Schlüssel an einen fremden Rechner."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _gateway_call(cfg: dict, chunk, language, prompt, want_words: bool) -> dict:
+    """Schickt ein Stück (float32, 16 kHz) ans Gateway und gibt die Antwort (verbose_json) zurück."""
+    fields = [("model", cfg["model"]), ("response_format", "verbose_json")]
+    if language:
+        fields.append(("language", language))
+    if prompt:
+        fields.append(("prompt", str(prompt)))
+    if want_words:
+        fields += [("timestamp_granularities[]", "segment"), ("timestamp_granularities[]", "word")]
+    body, ctype = _gw_multipart(fields, "audio.wav", _gw_wav(chunk))
+    opener = urllib.request.build_opener(_NoRedirect)
+    key = cfg["key"]
+    for attempt in range(cfg["retries"] + 1):
+        retry = False
+        try:
+            req = urllib.request.Request(
+                cfg["endpoint"], data=body, method="POST",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": ctype, "Accept": "application/json",
+                         "User-Agent": "docker-whisper-engine"},
+            )
+            with opener.open(req, timeout=cfg["timeout"]) as resp:
+                raw = resp.read(_GW_MAX_RESPONSE + 1)
+            if len(raw) > _GW_MAX_RESPONSE:
+                raise _GatewayError("response too large")
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            return data
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(2000).decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            error = _GatewayError(f"HTTP {exc.code}: {_gw_clean(detail, key)}" if detail else f"HTTP {exc.code}")
+            retry = exc.code in _GW_RETRY_STATUS
+        except _GatewayError:
+            raise
+        except (ValueError, UnicodeDecodeError):
+            error, retry = _GatewayError("invalid response (not JSON)"), False
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ssl.SSLError, OSError) as exc:
+            error, retry = _GatewayError(f"connection error: {_gw_clean(getattr(exc, 'reason', exc), key)}"), True
+        if not retry or attempt >= cfg["retries"]:
+            raise error
+        time.sleep(cfg["backoff"] * (2 ** attempt))
+    raise _GatewayError("unreachable")  # pragma: no cover
+
+
+def _gw_spans(audio, max_seconds: float):
+    """Schnittstellen (Anfang, Ende in Samples): jedes Stück höchstens max_seconds lang, geschnitten wird an der leisesten
+    Stelle in den letzten 8 Sekunden, damit kein Wort zerteilt wird."""
+    import numpy as np
+    n = len(audio)
+    max_n, search_n, frame = int(max_seconds * _GW_RATE), int(8 * _GW_RATE), int(0.1 * _GW_RATE)
+    spans, pos = [], 0
+    while n - pos > max_n:
+        lo = pos + max_n - search_n
+        window = audio[lo:pos + max_n]
+        k = len(window) // frame
+        energy = (np.asarray(window[:k * frame], dtype="float32").reshape(k, frame) ** 2).mean(axis=1)
+        cut = lo + int(np.argmin(energy)) * frame + frame // 2
+        spans.append((pos, cut))
+        pos = cut
+    spans.append((pos, n))
+    return spans
+
+
+def _gw_speech_spans(chunk):
+    """Sprechende Abschnitte (Sekunden) im Stück mit der Sprachaktivitäts-Erkennung der Bibliothek; None, wenn sie ausfällt."""
+    try:
+        from faster_whisper.vad import get_speech_timestamps
+        with _gw_vad_lock:
+            found = get_speech_timestamps(chunk)
+        return [(t["start"] / _GW_RATE, t["end"] / _GW_RATE) for t in found]
+    except Exception as exc:
+        _gw_warn_once("vad", "Speech detection for the gateway path failed (%s); sending every section", type(exc).__name__)
+        return None
+
+
+def _gw_segments(data: dict, offset: float, chunk_seconds: float, want_words: bool) -> list:
+    """Wandelt die Antwort in Segmente um, wie faster-whisper sie liefert (Zeitstempel um offset verschoben)."""
+    from faster_whisper.transcribe import Segment, Word
+    seg_fields = {f.name for f in dataclasses.fields(Segment)}
+    raw = data.get("segments")
+    if not isinstance(raw, list) or not raw:
+        text = str(data.get("text") or "").strip()
+        raw = [{"start": 0.0, "end": chunk_seconds, "text": text}] if text else []
+    words_raw = data.get("words") if want_words and isinstance(data.get("words"), list) else []
+    out = []
+    try:
+        for d in raw:
+            text = str(d.get("text") or "").strip()
+            if not text:
+                continue
+            start = min(max(float(d.get("start") or 0.0), 0.0), chunk_seconds)
+            end = min(max(float(d.get("end") or start), start), chunk_seconds)
+            words = None
+            if words_raw:
+                words = [
+                    Word(start=float(w["start"]) + offset, end=float(w["end"]) + offset, word=" " + str(w["word"]).strip(),
+                         probability=float(w.get("probability") or 0.0))
+                    for w in words_raw if isinstance(w, dict) and start - 0.05 <= float(w["start"]) <= end + 0.05
+                ] or None
+            values = dict(
+                id=0, seek=0, start=start + offset, end=end + offset, text=" " + text, tokens=list(d.get("tokens") or []),
+                avg_logprob=float(d.get("avg_logprob") or 0.0), compression_ratio=float(d.get("compression_ratio") or 0.0),
+                no_speech_prob=float(d.get("no_speech_prob") or 0.0), words=words, temperature=float(d.get("temperature") or 0.0),
+            )
+            out.append(Segment(**{k: v for k, v in values.items() if k in seg_fields}))
+    except (TypeError, ValueError, KeyError, AttributeError):
+        raise _GatewayError("invalid segment data in the response") from None
+    return out
+
+
+def _gw_filter_by_speech(segments: list, speech: list, offset: float) -> list:
+    """Verwirft Segmente, die fast nur in Stille liegen (Whisper erfindet dort gern Text wie "Vielen Dank fürs Zuschauen")."""
+    kept = []
+    for seg in segments:
+        a, b = seg.start - offset, seg.end - offset
+        length = max(b - a, 1e-6)
+        overlap = sum(max(0.0, min(b, e) - max(a, s)) for s, e in speech)
+        if overlap / length >= 0.15:
+            kept.append(seg)
+    return kept
+
+
+def _shift_segment(seg, offset: float):
+    """Verschiebt Segment und Wörter um offset Sekunden (Segment/Word sind Dataclasses)."""
+    words = seg.words
+    if words:
+        words = [dataclasses.replace(w, start=w.start + offset, end=w.end + offset) for w in words]
+    return dataclasses.replace(seg, start=seg.start + offset, end=seg.end + offset, words=words if words else seg.words)
+
+
 class _ChunkedInfo:
     """Leichtgewichtiger Ersatz für das von transcribe() zurückgegebene
     TranscriptionInfo-Objekt, wenn mehrere Chunks zusammengeführt werden.
@@ -735,6 +989,11 @@ class _TranscribeRun:
             raise ValueError(f"Audio is too long ({self.total_seconds / 60:.0f} min). Maximum allowed duration is {_max_duration_min} minutes.")
         if self.on_duration:
             self.on_duration(self.total_seconds)
+
+        gateway_cfg = _gateway_config()
+        if gateway_cfg is not None:
+            yield from self._iter_gateway(audio, sampling_rate, gateway_cfg)
+            return
 
         if self.total_seconds <= _CHUNK_THRESHOLD_SECONDS:
             segments_gen, info = _model.transcribe(audio, **self.kwargs)
@@ -793,6 +1052,105 @@ class _TranscribeRun:
             language_probability=first_info.language_probability if first_info else 0.0,
             duration=summed_duration,
             duration_after_vad=summed_duration_after_vad,
+        )
+
+    def _local_chunk(self, chunk, offset):
+        if _model is None:
+            raise RuntimeError("local model is not loaded")
+        segs_gen, _info = _model.transcribe(chunk, **self.kwargs)
+        for seg in segs_gen:
+            self._check()
+            yield _shift_segment(seg, offset)
+
+    def _iter_gateway(self, audio, sampling_rate, cfg):
+        spans = _gw_spans(audio, cfg["chunk_s"])
+        n = len(spans)
+        prompt = self.kwargs.get("initial_prompt")
+        want_words = bool(cfg["word_ts"] and self.kwargs.get("word_timestamps"))
+        lang = [cfg["language"] or self.kwargs.get("language")]  # None: wird aus den ersten Stücken bestimmt
+        votes = Counter()
+        stop = threading.Event()  # nach einem Gateway-Fehler gesetzt: der Rest läuft lokal
+        stats = {"gateway": 0, "silent": 0, "local": 0}
+        speech_seconds = 0.0
+        next_id = 0
+        logger.info("Gateway | %.1f min in %d Abschnitten (höchstens %.0f s), %d gleichzeitig, Modell %s", 
+                    len(audio) / sampling_rate / 60, n, cfg["chunk_s"], cfg["parallel"], cfg["model"])
+
+        def work(i):
+            if stop.is_set():
+                return "local", None
+            a, b = spans[i]
+            chunk = audio[a:b]
+            offset = a / sampling_rate
+            speech = _gw_speech_spans(chunk) if cfg["vad"] else None
+            if speech is not None and not speech:
+                return "silent", None
+            try:
+                data = _gateway_call(cfg, chunk, lang[0], prompt, want_words)
+                segs = _gw_segments(data, offset, len(chunk) / sampling_rate, want_words)
+            except _GatewayError as exc:
+                return "error", exc
+            if speech:
+                segs = _gw_filter_by_speech(segs, speech, offset)
+            return "ok", (segs, data.get("language"), speech, len(chunk) / sampling_rate)
+
+        pool = ThreadPoolExecutor(max_workers=cfg["parallel"])
+        futures = {}
+        try:
+            nxt = 0
+            for i in range(n):
+                self._check()
+                sequential = lang[0] is None and sum(votes.values()) < 3
+                limit = 1 if sequential else cfg["parallel"] * 2
+                while nxt < n and len(futures) < limit and (not sequential or nxt == i):
+                    futures[nxt] = pool.submit(work, nxt)
+                    nxt += 1
+                fut = futures.pop(i)
+                while True:
+                    try:
+                        status, payload = fut.result(timeout=0.5)
+                        break
+                    except FutureTimeout:
+                        self._check()
+                a, b = spans[i]
+                offset = a / sampling_rate
+                if status == "ok":
+                    segs, detected, speech, seconds = payload
+                    stats["gateway"] += 1
+                    speech_seconds += sum(e - s for s, e in speech) if speech else seconds
+                    if lang[0] is None and isinstance(detected, str) and re.fullmatch(r"[a-z]{2,3}", detected.strip().lower()):
+                        votes[detected.strip().lower()] += 1
+                        if sum(votes.values()) >= 3:
+                            lang[0] = votes.most_common(1)[0][0]
+                    for seg in segs:
+                        self._check()
+                        yield dataclasses.replace(seg, id=next_id)
+                        next_id += 1
+                elif status == "silent":
+                    stats["silent"] += 1
+                else:  # "error" oder "local": dieses Stück läuft auf dem lokalen Modell
+                    if status == "error":
+                        if not cfg["fallback"]:
+                            raise payload
+                        if not stop.is_set():  # nur der erste Fehler wird gemeldet (andere Stücke können gleichzeitig scheitern)
+                            logger.warning("Gateway failed (%s); the remaining sections run on the local model", payload)
+                            stop.set()
+                    stats["local"] += 1
+                    speech_seconds += (b - a) / sampling_rate
+                    for seg in self._local_chunk(audio[a:b], offset):
+                        yield dataclasses.replace(seg, id=next_id)
+                        next_id += 1
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        logger.info("Gateway | fertig: %d Abschnitte über das Gateway, %d übersprungen (Stille), %d lokal",
+                    stats["gateway"], stats["silent"], stats["local"])
+        detected_language = lang[0] or (votes.most_common(1)[0][0] if votes else None)
+        self.info = _ChunkedInfo(
+            language=detected_language,
+            language_probability=1.0 if lang[0] else (0.5 if detected_language else 0.0),
+            duration=len(audio) / sampling_rate,
+            duration_after_vad=speech_seconds,
         )
 
 
